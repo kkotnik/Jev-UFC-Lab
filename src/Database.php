@@ -18,6 +18,7 @@ final class Database
         ]);
         $this->pdo->exec('PRAGMA foreign_keys = ON');
         $this->pdo->exec('PRAGMA journal_mode = WAL');
+        $this->pdo->exec('PRAGMA busy_timeout = 8000');
         $this->migrate();
         $this->seed();
     }
@@ -170,6 +171,7 @@ CREATE TABLE IF NOT EXISTS fight_prefight_data (
 SQL);
         $this->pdo->exec("INSERT OR IGNORE INTO settings(key,value) VALUES ('min_event_stake','0')");
         $this->pdo->exec("INSERT OR IGNORE INTO settings(key,value) VALUES ('max_event_fraction','0.35')");
+        $this->pdo->exec("INSERT OR IGNORE INTO settings(key,value) VALUES ('bankroll_unit','\"eur\"')");
         $futureEvents = [
             ['UFC Fight Night: Buckley vs Malott','2026-10-17T23:00:00+02:00','Rogers Place, Edmonton','https://www.ufc.com/event/ufc-fight-night-october-17-2026'],
             ['UFC 333: Volkanovski vs Evloev','2026-10-24T18:00:00+02:00','Etihad Arena, Abu Dhabi','https://www.ufc.com/event/ufc-333'],

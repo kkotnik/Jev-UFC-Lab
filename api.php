@@ -106,6 +106,8 @@ SQL);
                 'max_bet_fraction' => $database->setting('max_bet_fraction', .1),
                 'max_event_fraction' => $database->setting('max_event_fraction', .35),
                 'min_edge' => $database->setting('min_edge', .05),
+                'starting_bankroll' => $database->setting('starting_bankroll', 500.0),
+                'bankroll_unit' => $database->setting('bankroll_unit', 'eur'),
             ],
         ]);
     }
@@ -155,7 +157,8 @@ SQL);
         $fightId = (int) ($input['fight_id'] ?? 0);
         $selection = trim((string) ($input['selection'] ?? ''));
         $odds = (float) ($input['odds'] ?? 0);
-        $stake = round((float) ($input['stake'] ?? 0), 2);
+        $stake = (float) ($input['stake'] ?? 0);
+        $stake = $service->moneyRound($stake);
         $fightStmt = $pdo->prepare('SELECT * FROM fights WHERE id=? AND completed=0');
         $fightStmt->execute([$fightId]);
         $fight = $fightStmt->fetch();
@@ -247,6 +250,24 @@ SQL);
         json_response(['ok'=>true,'sync'=>(new UfcEventSync($pdo))->syncCard((int)($input['event_id']??0))]);
     }
 
+    if ($action === 'sync_ufc_schedule') {
+        set_time_limit(180);
+        $sync = (new UfcEventSync($pdo))->syncSchedule((int) ($input['event_id'] ?? 0));
+        $oddsKey = trim((string) ($_SERVER['HTTP_X_ODDS_KEY'] ?? getenv('THE_ODDS_API_KEY') ?: ''));
+        if ($oddsKey !== '') {
+            try {
+                $odds = (new OddsClient($pdo, $oddsKey))->sync();
+                $sync['odds_updated'] = (int) $odds['updated_fights'];
+            } catch (Throwable $throwable) {
+                $sync['odds_updated'] = 0;
+                $sync['odds_error'] = $throwable->getMessage();
+            }
+        } else {
+            $sync['odds_updated'] = 0;
+        }
+        json_response(['ok' => true, 'sync' => $sync]);
+    }
+
     if ($action === 'refresh_prefight') {
         json_response(['ok'=>true,'sync'=>(new PreFightDataService($database))->refreshEvent((int)($input['event_id']??0))]);
     }
@@ -257,6 +278,35 @@ SQL);
             if (array_key_exists($key, $input)) {
                 $database->setSetting($key, max($min, min($max, (float) $input[$key])));
             }
+        }
+        if (array_key_exists('bankroll_unit', $input)) {
+            $unit = strtolower(trim((string) $input['bankroll_unit']));
+            if ($unit !== 'btc') {
+                $unit = 'eur';
+            }
+            $database->setSetting('bankroll_unit', $unit);
+        }
+        if (array_key_exists('starting_bankroll', $input)) {
+            $unit = (string) $database->setting('bankroll_unit', 'eur');
+            $bankroll = (float) $input['starting_bankroll'];
+            if ($unit === 'btc') {
+                $bankroll = round($bankroll, 8);
+                if ($bankroll < 0.00000001) {
+                    throw new InvalidArgumentException('Bankroll mora biti vsaj 0.00000001 BTC.');
+                }
+                if ($bankroll > 100) {
+                    throw new InvalidArgumentException('Bankroll je omejen na 100 BTC.');
+                }
+            } else {
+                $bankroll = round($bankroll, 2);
+                if ($bankroll < 10) {
+                    throw new InvalidArgumentException('Bankroll mora biti vsaj 10 €.');
+                }
+                if ($bankroll > 1000000) {
+                    throw new InvalidArgumentException('Bankroll je omejen na 1 000 000 €.');
+                }
+            }
+            $database->setSetting('starting_bankroll', $bankroll);
         }
         json_response(['ok' => true]);
     }

@@ -220,11 +220,15 @@ SQL);
         $fraction = (float) $this->database->setting('kelly_fraction', 0.50);
         $maxBet = $bankroll * (float) $this->database->setting('max_bet_fraction', 0.15);
         $eventLimit = $bankroll * (float) $this->database->setting('max_event_fraction', 0.35);
+        if ($this->isBtc()) {
+            $maxBet = $bankroll;
+            $eventLimit = $bankroll;
+        }
         $eventExposureStmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND event_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
         $eventExposureStmt->execute([$fight['event_id']]);
         $eventRoom = max(0.0, $eventLimit - (float) $eventExposureStmt->fetchColumn());
         $stake = min($bankroll * $fraction * $best['kelly'], $maxBet, $eventRoom, $this->availableBankroll('jev', 'single'));
-        $stake = floor(max(0.0, $stake) * 100) / 100;
+        $stake = $this->moneyFloor(max(0.0, $stake));
         return ['selection' => $best['name'], 'odds' => $best['decimal'], 'edge' => $best['edge'], 'stake' => $stake];
     }
 
@@ -234,11 +238,11 @@ SQL);
         if ($owner === 'me') {
             $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(profit),0) FROM bets WHERE owner=? AND result != "open"');
             $stmt->execute([$owner]);
-            return round($start + (float) $stmt->fetchColumn(), 2);
+            return round($start + (float) $stmt->fetchColumn(), $this->moneyPlaces());
         }
         $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(profit),0) FROM bets WHERE owner="jev" AND result != "open" AND ' . $this->modeMarketSql($mode));
         $stmt->execute();
-        return round($start + (float) $stmt->fetchColumn(), 2);
+        return round($start + (float) $stmt->fetchColumn(), $this->moneyPlaces());
     }
 
     public function availableBankroll(string $owner, string $mode = 'single'): float
@@ -396,31 +400,24 @@ SQL);
         $otherStmt = $pdo->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND result="open" AND event_id!=? AND market NOT IN ("kombinacija","sistem")');
         $otherStmt->execute([$eventId]);
         $capacity = max(0.0, $bankroll - (float) $otherStmt->fetchColumn());
-        $eventCap = min($capacity, $bankroll * (float) $this->database->setting('max_event_fraction', .35));
+        $eventCap = $this->eventStakeCap($bankroll, $capacity);
         $fraction = (float) $this->database->setting('kelly_fraction', .5);
         $maxBet = $bankroll * (float) $this->database->setting('max_bet_fraction', .15);
-        $desired = 0.0;
+        if ($this->isBtc()) {
+            $maxBet = $eventCap;
+        }
         foreach ($candidates as &$candidate) {
             $candidate['raw_stake'] = $bankroll * $fraction * $candidate['kelly'] * $candidate['confidence'];
-            $desired += $candidate['raw_stake'];
         }
         unset($candidate);
-        if ($desired > $eventCap && $desired > 0) {
-            $scale = $eventCap / $desired;
-        } else {
-            $scale = 1.0;
-        }
-        foreach ($candidates as &$candidate) {
-            $candidate['stake'] = floor(min($candidate['raw_stake'] * $scale, $maxBet) * 100) / 100;
-        }
-        unset($candidate);
+        $this->assignKellyStakes($candidates, $eventCap, $maxBet);
         $selected = [];
         foreach ($candidates as $candidate) {
             if ($candidate['stake'] > 0) {
                 $selected[] = $candidate;
             }
         }
-        $target = round(array_sum(array_column($selected, 'stake')), 2);
+        $target = $this->moneyRound(array_sum(array_column($selected, 'stake')));
         $pdo->beginTransaction();
         try {
             $existingStmt = $pdo->prepare('SELECT * FROM bets WHERE owner="jev" AND event_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
@@ -487,12 +484,24 @@ SQL);
         $capacity = max(0.0, $bankroll - (float) $otherStmt->fetchColumn());
         $fraction = (float) $this->database->setting('kelly_fraction', .5);
         $engine = new EstaveTicketService();
-        $ticket = $engine->buildTicket($candidates, $bankroll, [
+        $ticketSettings = [
             'kelly_fraction' => $fraction,
             'max_bet_fraction' => (float) $this->database->setting('max_bet_fraction', .15),
             'max_event_fraction' => (float) $this->database->setting('max_event_fraction', .35),
             'available' => $capacity,
-        ]);
+        ];
+        if ($this->isBtc()) {
+            $ticketSettings['min_stake'] = 0.00000001;
+            $ticketSettings['max_ticket_stake'] = max($capacity, 0.00000001);
+            $ticketSettings['max_bet_fraction'] = 1.0;
+            $ticketSettings['max_event_fraction'] = 1.0;
+            $ticketSettings['money_scale'] = 100000000;
+            $ticketSettings['max_payout'] = 1000000.0;
+        }
+        $ticket = $engine->buildTicket($candidates, $bankroll, $ticketSettings);
+        if ($this->isBtc() && $ticket !== null) {
+            $ticket = $this->fillBtcTicketStake($ticket, min($capacity, $bankroll));
+        }
 
         $pdo->beginTransaction();
         try {
@@ -568,5 +577,117 @@ SQL);
         $prediction['method_probs'] = json_decode($prediction['method_probs_json'], true) ?: [];
         unset($prediction['raw_json'], $prediction['method_probs_json']);
         return $prediction;
+    }
+
+    private function eventStakeCap(float $bankroll, float $capacity): float
+    {
+        if ($this->isBtc()) {
+            return $this->moneyFloor($capacity);
+        }
+        $eventLimit = $bankroll * (float) $this->database->setting('max_event_fraction', 0.35);
+        return $this->moneyFloor(min($capacity, $eventLimit));
+    }
+
+    private function assignKellyStakes(array &$candidates, float $eventCap, float $maxBet): void
+    {
+        $desired = 0.0;
+        foreach ($candidates as $candidate) {
+            $desired += (float) $candidate['raw_stake'];
+        }
+        $scale = 1.0;
+        if ($desired > 0) {
+            if ($this->isBtc()) {
+                $scale = $eventCap / $desired;
+            } else if ($desired > $eventCap) {
+                $scale = $eventCap / $desired;
+            }
+        }
+        foreach ($candidates as &$candidate) {
+            $candidate['stake'] = $this->moneyFloor(min((float) $candidate['raw_stake'] * $scale, $maxBet));
+        }
+        unset($candidate);
+        if (!$this->isBtc() || $eventCap <= 0) {
+            return;
+        }
+        $placed = 0.0;
+        $bestIndex = null;
+        $bestRaw = -1.0;
+        foreach ($candidates as $index => $candidate) {
+            $placed += (float) $candidate['stake'];
+            if ((float) $candidate['raw_stake'] > $bestRaw) {
+                $bestRaw = (float) $candidate['raw_stake'];
+                $bestIndex = $index;
+            }
+        }
+        if ($bestIndex === null) {
+            return;
+        }
+        $gap = $this->moneyRound($eventCap - $placed);
+        if ($gap > 0) {
+            $candidates[$bestIndex]['stake'] = $this->moneyRound((float) $candidates[$bestIndex]['stake'] + $gap);
+        }
+    }
+
+    private function fillBtcTicketStake(array $ticket, float $budget): array
+    {
+        $fill = $this->moneyFloor($budget);
+        if ($fill <= 0) {
+            return $ticket;
+        }
+        if (($ticket['type'] ?? '') === 'sistem') {
+            $unit = $this->moneyFloor($fill / 3);
+            if ($unit <= 0) {
+                return $ticket;
+            }
+            $total = $this->moneyRound($unit * 3);
+            $ticket['unit_stake'] = $unit;
+            $ticket['stake'] = $total;
+            $allHit = 0.0;
+            foreach ($ticket['combos'] ?? [] as $combo) {
+                $allHit += $unit * (float) $combo['odds'];
+            }
+            $ticket['possible_payout'] = $this->moneyRound($allHit);
+            $ticket['possible_profit'] = $this->moneyRound($allHit - $total);
+            return $ticket;
+        }
+        $ticket['stake'] = $fill;
+        $ticket['unit_stake'] = $fill;
+        $payout = $fill * (float) $ticket['combined_odds'];
+        $ticket['possible_payout'] = $this->moneyRound($payout);
+        $ticket['possible_profit'] = $this->moneyRound($payout - $fill);
+        return $ticket;
+    }
+
+    public function isBtc(): bool
+    {
+        return (string) $this->database->setting('bankroll_unit', 'eur') === 'btc';
+    }
+
+    public function moneyFloor(float $value): float
+    {
+        $scale = $this->moneyScale();
+        return floor($value * $scale) / $scale;
+    }
+
+    public function moneyRound(float $value): float
+    {
+        $scale = $this->moneyScale();
+        return round($value * $scale) / $scale;
+    }
+
+    private function moneyScale(): int
+    {
+        if ($this->isBtc()) {
+            return 100000000;
+        }
+        return 100;
+    }
+
+    private function moneyPlaces(): int
+    {
+        if ($this->isBtc()) {
+            return 8;
+        }
+        return 2;
     }
 }

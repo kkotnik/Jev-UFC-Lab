@@ -23,39 +23,93 @@ final class OddsClient
         curl_close($curl);
         $events = is_string($body) ? json_decode($body, true) : null;
         if ($error !== '' || $status < 200 || $status >= 300 || !is_array($events)) {
-            $message = is_array($events) ? ($events['message'] ?? $events['error'] ?? '') : '';
-            throw new RuntimeException('Prenos kvot ni uspel: ' . ($message ?: $error ?: 'HTTP ' . $status));
+            $message = '';
+            if (is_array($events)) {
+                if (isset($events['message'])) {
+                    $message = (string) $events['message'];
+                } elseif (isset($events['error'])) {
+                    $message = (string) $events['error'];
+                }
+            }
+            if ($message === '') {
+                if ($error !== '') {
+                    $message = $error;
+                } else {
+                    $message = 'HTTP ' . $status;
+                }
+            }
+            throw new RuntimeException('Prenos kvot ni uspel: ' . $message);
         }
-        $best = [];
+        $booksByFight = [];
         foreach ($events as $event) {
             foreach (($event['bookmakers'] ?? []) as $bookmaker) {
-                foreach (($bookmaker['markets'] ?? []) as $market) {
-                    if (($market['key'] ?? '') !== 'h2h') continue;
-                    foreach (($market['outcomes'] ?? []) as $outcome) {
+                foreach (($bookmaker['markets'] ?? []) as $bookMarket) {
+                    if (($bookMarket['key'] ?? '') !== 'h2h') {
+                        continue;
+                    }
+                    $prices = [];
+                    foreach (($bookMarket['outcomes'] ?? []) as $outcome) {
                         $name = $this->normalize((string) ($outcome['name'] ?? ''));
                         $price = (float) ($outcome['price'] ?? 0);
-                        if ($name !== '' && $price > 1 && (!isset($best[$name]) || $price > $best[$name])) $best[$name] = $price;
+                        if ($name !== '' && $price > 1) {
+                            $prices[$name] = $price;
+                        }
+                    }
+                    if (count($prices) >= 2) {
+                        $booksByFight[] = $prices;
                     }
                 }
             }
         }
-        $fights = $this->pdo->query('SELECT f.* FROM fights f WHERE f.completed=0 AND NOT EXISTS(SELECT 1 FROM predictions p WHERE p.fight_id=f.id)')->fetchAll();
+        $fights = $this->pdo->query('SELECT f.* FROM fights f WHERE f.completed=0')->fetchAll();
         $update = $this->pdo->prepare('UPDATE fights SET odds_a=?,odds_b=? WHERE id=?');
         $updated = 0;
         foreach ($fights as $fight) {
-            $a = $best[$this->normalize($fight['fighter_a'])] ?? null;
-            $b = $best[$this->normalize($fight['fighter_b'])] ?? null;
-            if ($a !== null || $b !== null) {
-                $update->execute([$a ?? $fight['odds_a'], $b ?? $fight['odds_b'], $fight['id']]);
-                $updated++;
+            $pair = $this->sharpestPair($booksByFight, (string) $fight['fighter_a'], (string) $fight['fighter_b']);
+            if ($pair === null) {
+                continue;
+            }
+            $update->execute([$pair[0], $pair[1], $fight['id']]);
+            $updated++;
+        }
+        return ['updated_fights' => $updated, 'market_events' => count($events), 'matched_prices' => count($booksByFight)];
+    }
+
+    private function sharpestPair(array $booksByFight, string $fighterA, string $fighterB): ?array
+    {
+        $normA = $this->normalize($fighterA);
+        $normB = $this->normalize($fighterB);
+        $chosenA = null;
+        $chosenB = null;
+        $chosenFav = null;
+        foreach ($booksByFight as $prices) {
+            if (!isset($prices[$normA], $prices[$normB])) {
+                continue;
+            }
+            $oddsA = (float) $prices[$normA];
+            $oddsB = (float) $prices[$normB];
+            $fav = $oddsA;
+            if ($oddsB < $fav) {
+                $fav = $oddsB;
+            }
+            if ($chosenFav === null || $fav < $chosenFav) {
+                $chosenA = $oddsA;
+                $chosenB = $oddsB;
+                $chosenFav = $fav;
             }
         }
-        return ['updated_fights' => $updated, 'market_events' => count($events), 'matched_prices' => count($best)];
+        if ($chosenA === null || $chosenB === null) {
+            return null;
+        }
+        return [round($chosenA, 6), round($chosenB, 6)];
     }
 
     private function normalize(string $name): string
     {
         $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $name);
-        return strtolower((string) preg_replace('/[^a-z0-9]+/i', '', $ascii === false ? $name : $ascii));
+        if ($ascii === false) {
+            $ascii = $name;
+        }
+        return strtolower((string) preg_replace('/[^a-z0-9]+/i', '', $ascii));
     }
 }

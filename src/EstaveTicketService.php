@@ -12,6 +12,11 @@ final class EstaveTicketService
     public const WINNINGS_TAX_RATE = 0.15;
     public const WINNINGS_TAX_THRESHOLD = 300.0;
 
+    private float $minStake = self::MIN_STAKE;
+    private float $maxTicketStake = self::MAX_TICKET_STAKE;
+    private float $maxPayout = self::MAX_PAYOUT;
+    private int $moneyScale = 100;
+
     public function qualifyingLegs(array $rows, float $minEdge, float $minConfidence): array
     {
         $legs = [];
@@ -78,6 +83,22 @@ final class EstaveTicketService
         $maxBet = $bankroll * (float) ($settings['max_bet_fraction'] ?? 0.15);
         $eventCap = $bankroll * (float) ($settings['max_event_fraction'] ?? 0.35);
         $available = (float) ($settings['available'] ?? $bankroll);
+        $this->minStake = self::MIN_STAKE;
+        if (isset($settings['min_stake'])) {
+            $this->minStake = (float) $settings['min_stake'];
+        }
+        $this->maxTicketStake = self::MAX_TICKET_STAKE;
+        if (isset($settings['max_ticket_stake'])) {
+            $this->maxTicketStake = (float) $settings['max_ticket_stake'];
+        }
+        $this->moneyScale = 100;
+        if (isset($settings['money_scale'])) {
+            $this->moneyScale = (int) $settings['money_scale'];
+        }
+        $this->maxPayout = self::MAX_PAYOUT;
+        if (isset($settings['max_payout'])) {
+            $this->maxPayout = (float) $settings['max_payout'];
+        }
         $combo = $this->bestKombinacija($legs, $bankroll, $kellyFraction, $maxBet, $eventCap, $available);
         if (count($legs) < 3) {
             return $combo;
@@ -310,13 +331,13 @@ final class EstaveTicketService
             return null;
         }
         $raw = $bankroll * $kellyFraction * $kelly * $minConf;
-        $stake = min($raw, $maxBet, $eventCap, $available, self::MAX_TICKET_STAKE);
-        $maxStakeForPayout = self::MAX_PAYOUT / $combinedOdds;
+        $stake = min($raw, $maxBet, $eventCap, $available, $this->maxTicketStake);
+        $maxStakeForPayout = $this->maxPayout / $combinedOdds;
         if ($stake > $maxStakeForPayout) {
             $stake = $maxStakeForPayout;
         }
-        $stake = floor($stake * 100) / 100;
-        if ($stake < self::MIN_STAKE) {
+        $stake = $this->moneyFloor($stake);
+        if ($stake < $this->minStake) {
             return null;
         }
         $payout = $stake * $combinedOdds;
@@ -339,8 +360,8 @@ final class EstaveTicketService
             'combined_edge' => $combinedEdge,
             'kelly' => $kelly,
             'stake' => $stake,
-            'possible_payout' => round($payout, 2),
-            'possible_profit' => round($netPayout - $stake, 2),
+            'possible_payout' => $this->moneyRound($payout),
+            'possible_profit' => $this->moneyRound($netPayout - $stake),
             'ev' => $ev,
         ];
     }
@@ -356,12 +377,12 @@ final class EstaveTicketService
             $raw += $bankroll * $kellyFraction * (float) $leg['kelly'] * (float) $leg['confidence'];
             $names[] = (string) $leg['selection'];
         }
-        $total = min($raw, $eventCap, $available, self::MAX_TICKET_STAKE);
-        $unit = floor(($total / 3) * 100) / 100;
-        if ($unit < self::MIN_STAKE) {
+        $total = min($raw, $eventCap, $available, $this->maxTicketStake);
+        $unit = $this->moneyFloor($total / 3);
+        if ($unit < $this->minStake) {
             return null;
         }
-        $total = round($unit * 3, 2);
+        $total = $this->moneyRound($unit * 3);
         $pairs = [[0, 1], [0, 2], [1, 2]];
         $combos = [];
         $allHitPayout = 0.0;
@@ -397,8 +418,8 @@ final class EstaveTicketService
             'combined_edge' => $combinedP - (1 / max(0.01, $combinedOdds)),
             'kelly' => 0.0,
             'stake' => $total,
-            'possible_payout' => round($this->netPayout($allHitPayout), 2),
-            'possible_profit' => round($this->netPayout($allHitPayout) - $total, 2),
+            'possible_payout' => $this->moneyRound($this->netPayout($allHitPayout)),
+            'possible_profit' => $this->moneyRound($this->netPayout($allHitPayout) - $total),
             'ev' => $ev,
         ];
     }
@@ -437,5 +458,15 @@ final class EstaveTicketService
             return $payout * (1 - self::WINNINGS_TAX_RATE);
         }
         return $payout;
+    }
+
+    private function moneyFloor(float $value): float
+    {
+        return floor($value * $this->moneyScale) / $this->moneyScale;
+    }
+
+    private function moneyRound(float $value): float
+    {
+        return round($value * $this->moneyScale) / $this->moneyScale;
     }
 }
