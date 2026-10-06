@@ -49,6 +49,20 @@ $storedSingles = $backtest->loadNamed(BacktestService::SINGLES_BATCH_NAME);
 $storedTicket = $backtest->loadNamed(BacktestService::BATCH_NAME);
 $checks['Shranjen single backtest'] = $storedSingles !== null && (int) ($storedSingles['version'] ?? 0) >= 5;
 $checks['Shranjen listek backtest'] = $storedTicket !== null && (int) ($storedTicket['version'] ?? 0) >= 6;
+$slug = StakeMethodMarket::eventUrl('UFC Fight Night: Allen vs Duncan');
+$checks['Stake event URL'] = $slug === 'https://stake.com/sports/mma/ufc/ufc-fight-night-allen-vs-duncan';
+$koHit = StakeMethodMarket::selectionHits('Ernesta Kareckaite by KO/TKO', 'winning_method', 'Ernesta Kareckaite', 'KO/TKO');
+$koMiss = StakeMethodMarket::selectionHits('Ernesta Kareckaite by KO/TKO', 'winning_method', 'Ernesta Kareckaite', 'Decision');
+$mlHit = StakeMethodMarket::selectionHits('Melissa Gatto', 'moneyline', 'Melissa Gatto', 'Decision');
+$checks['Method stava zadane KO'] = $koHit === true;
+$checks['Method stava pade na decision'] = $koMiss === false;
+$checks['Moneyline ignorira method'] = $mlHit === true;
+$checks['Smetnje method kvote'] = StakeMethodMarket::methodOddsUsable(29.0, 1.41, 'a_ko_tko') === false;
+$checks['Realna method kvota'] = StakeMethodMarket::methodOddsUsable(2.10, 1.55, 'a_ko_tko') === true;
+$methodBacktest = $backtest->ensureMethodSinglesBacktest();
+$checks['Method backtest shranjen'] = $methodBacktest !== null && (int) ($methodBacktest['version'] ?? 0) >= 7;
+$checks['Winner-only primerjava'] = isset($methodBacktest['winner_only']['profit'], $methodBacktest['winner_only_locked']['profit']);
+$checks['Stari single backtest ostane'] = $storedSingles !== null && $methodBacktest !== null && (string) $methodBacktest['event_name'] !== (string) $storedSingles['event_name'];
 
 $failed = false;
 foreach ($checks as $label => $passed) {

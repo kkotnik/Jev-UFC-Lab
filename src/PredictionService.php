@@ -295,54 +295,101 @@ SQL);
         return $this->finalizeTicketPortfolio($eventId);
     }
 
-    private function collectCandidates(int $eventId): array
+    private function collectCandidates(int $eventId, bool $includeMethods = false): array
     {
         $pdo = $this->database->pdo();
         $stmt = $pdo->prepare(<<<'SQL'
-SELECT p.id prediction_id,p.fight_id,p.p_a,p.p_b,p.confidence,
+SELECT p.id prediction_id,p.fight_id,p.p_a,p.p_b,p.confidence,p.method_probs_json,p.method_pick,
        f.fighter_a,f.fighter_b,f.odds_a,f.odds_b
 FROM predictions p JOIN fights f ON f.id=p.fight_id
 WHERE p.id=(SELECT p2.id FROM predictions p2 WHERE p2.fight_id=f.id ORDER BY p2.id DESC LIMIT 1)
   AND f.event_id=? AND f.completed=0 AND (f.odds_a IS NOT NULL OR f.odds_b IS NOT NULL)
+ORDER BY f.card_order
 SQL);
         $stmt->execute([$eventId]);
         $candidates = [];
         $rows = $stmt->fetchAll();
+        $minEdge = (float) $this->database->setting('min_edge', .05);
+        $policy = $this->database->setting('single_method_policy', StakeMethodMarket::defaultPolicy());
+        if (!is_array($policy)) {
+            $policy = StakeMethodMarket::defaultPolicy();
+        }
+        $eligibleSeq = 0;
         foreach ($rows as $row) {
-            $options = [];
-            if ($row['odds_a'] !== null) {
-                $options[] = ['selection' => $row['fighter_a'], 'p' => (float) $row['p_a'], 'odds' => (float) $row['odds_a']];
+            $oddsA = $row['odds_a'] === null ? null : (float) $row['odds_a'];
+            $oddsB = $row['odds_b'] === null ? null : (float) $row['odds_b'];
+            $pA = (float) $row['p_a'];
+            $pB = (float) $row['p_b'];
+            $rawProbs = json_decode((string) $row['method_probs_json'], true);
+            if (!is_array($rawProbs)) {
+                $rawProbs = [];
             }
-            if ($row['odds_b'] !== null) {
-                $options[] = ['selection' => $row['fighter_b'], 'p' => (float) $row['p_b'], 'odds' => (float) $row['odds_b']];
-            }
-            foreach ($options as &$option) {
-                $option['edge'] = $option['p'] - (1 / $option['odds']);
-            }
-            unset($option);
-            usort($options, static fn(array $a, array $b): int => $b['edge'] <=> $a['edge']);
-            if (!$options) {
+            $methodProbs = StakeMethodMarket::normalizeProbs($rawProbs);
+            if (!$includeMethods) {
+                $options = [];
+                $mlA = StakeMethodMarket::moneylineOption((string) $row['fighter_a'], $pA, $oddsA);
+                $mlB = StakeMethodMarket::moneylineOption((string) $row['fighter_b'], $pB, $oddsB);
+                if ($mlA !== null) {
+                    $options[] = $mlA;
+                }
+                if ($mlB !== null) {
+                    $options[] = $mlB;
+                }
+                $best = StakeMethodMarket::bestOption($options, $minEdge);
+                if ($best === null) {
+                    continue;
+                }
+                if ((float) $row['confidence'] < .55) {
+                    continue;
+                }
+                $best['fight_id'] = (int) $row['fight_id'];
+                $best['prediction_id'] = (int) $row['prediction_id'];
+                $best['confidence'] = (float) $row['confidence'];
+                $best['fighter_a'] = (string) $row['fighter_a'];
+                $best['fighter_b'] = (string) $row['fighter_b'];
+                $best['method_probs'] = $methodProbs;
+                $candidates[] = $best;
                 continue;
             }
-            $best = $options[0];
+            $built = StakeMethodMarket::fightOptions(
+                (string) $row['fighter_a'],
+                (string) $row['fighter_b'],
+                $pA,
+                $pB,
+                $oddsA,
+                $oddsB,
+                $methodProbs,
+                []
+            );
+            $choice = StakeMethodMarket::recommend($built['moneyline'], $built['methods'], $minEdge, $policy, $eligibleSeq);
+            if ($choice['bet'] === null) {
+                continue;
+            }
+            if ((float) $row['confidence'] < .55) {
+                continue;
+            }
+            $best = $choice['bet'];
             $best['fight_id'] = (int) $row['fight_id'];
             $best['prediction_id'] = (int) $row['prediction_id'];
             $best['confidence'] = (float) $row['confidence'];
             $best['fighter_a'] = (string) $row['fighter_a'];
             $best['fighter_b'] = (string) $row['fighter_b'];
-            $best['kelly'] = (($best['odds'] * $best['p']) - 1) / max(.01, $best['odds'] - 1);
-            if ($best['edge'] >= (float) $this->database->setting('min_edge', .05) && $best['kelly'] > 0 && $best['confidence'] >= .55) {
-                $candidates[] = $best;
-            }
+            $best['method_probs'] = $methodProbs;
+            $best['reason'] = $choice['reason'];
+            $candidates[] = $best;
         }
-        usort($candidates, static fn(array $a, array $b): int => $b['edge'] <=> $a['edge']);
+        if (!$includeMethods) {
+            usort($candidates, static function (array $a, array $b): int {
+                return $b['edge'] <=> $a['edge'];
+            });
+        }
         return ['candidates' => $candidates, 'analyzed' => count($rows)];
     }
 
     private function finalizeSinglesPortfolio(int $eventId): array
     {
         $pdo = $this->database->pdo();
-        $collected = $this->collectCandidates($eventId);
+        $collected = $this->collectCandidates($eventId, true);
         $candidates = $collected['candidates'];
         $analyzedCount = $collected['analyzed'];
         $bankroll = $this->bankroll('jev', 'single');
@@ -382,20 +429,21 @@ SQL);
             foreach ($existingStmt->fetchAll() as $bet) {
                 $existing[(int) $bet['fight_id']] = $bet;
             }
-            $updateBet = $pdo->prepare('UPDATE bets SET selection=?,odds=?,stake=? WHERE id=?');
-            $insertBet = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"jev",?,"moneyline",?,?)');
+            $updateBet = $pdo->prepare('UPDATE bets SET selection=?,market=?,odds=?,stake=? WHERE id=?');
+            $insertBet = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"jev",?,?,?,?)');
             $updatePrediction = $pdo->prepare('UPDATE predictions SET recommended_bet=?,recommended_odds=?,edge=?,stake=? WHERE id=?');
             foreach ($selected as $candidate) {
+                $market = (string) ($candidate['market'] ?? 'moneyline');
                 if (isset($existing[$candidate['fight_id']])) {
-                    $updateBet->execute([$candidate['selection'], $candidate['odds'], $candidate['stake'], $existing[$candidate['fight_id']]['id']]);
+                    $updateBet->execute([$candidate['selection'], $market, $candidate['odds'], $candidate['stake'], $existing[$candidate['fight_id']]['id']]);
                     unset($existing[$candidate['fight_id']]);
                 } else {
-                    $insertBet->execute([$eventId, $candidate['fight_id'], $candidate['selection'], $candidate['odds'], $candidate['stake']]);
+                    $insertBet->execute([$eventId, $candidate['fight_id'], $candidate['selection'], $market, $candidate['odds'], $candidate['stake']]);
                 }
                 $updatePrediction->execute([$candidate['selection'], $candidate['odds'], $candidate['edge'], $candidate['stake'], $candidate['prediction_id']]);
             }
             foreach ($existing as $bet) {
-                $updateBet->execute([$bet['selection'], $bet['odds'], 0, $bet['id']]);
+                $updateBet->execute([$bet['selection'], $bet['market'], $bet['odds'], 0, $bet['id']]);
             }
             $pdo->commit();
         } catch (Throwable $throwable) {
@@ -411,7 +459,9 @@ SQL);
                 'probability' => $c['p'],
                 'edge' => $c['edge'],
                 'stake' => $c['stake'],
-                'market' => 'moneyline',
+                'market' => $c['market'] ?? 'moneyline',
+                'method_label' => $c['method_label'] ?? 'Moneyline',
+                'reason' => $c['reason'] ?? '',
             ];
         }
         return [

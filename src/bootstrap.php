@@ -11,6 +11,7 @@ require_once __DIR__ . '/UfcStatsSync.php';
 require_once __DIR__ . '/UfcEventSync.php';
 require_once __DIR__ . '/OddsClient.php';
 require_once __DIR__ . '/EstaveTicketService.php';
+require_once __DIR__ . '/StakeMethodMarket.php';
 require_once __DIR__ . '/PredictionService.php';
 require_once __DIR__ . '/PreFightDataService.php';
 require_once __DIR__ . '/EventReviewService.php';

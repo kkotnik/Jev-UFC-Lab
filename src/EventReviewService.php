@@ -43,7 +43,7 @@ final class EventReviewService
                     $winner = $this->normalize($actual['winner']) === $this->normalize($fight['fighter_a']) ? $fight['fighter_a'] : $fight['fighter_b'];
                     $update = $pdo->prepare('UPDATE fights SET winner=?,method=?,result_round=?,completed=1 WHERE id=?');
                     $update->execute([$winner, $actual['method'], $actual['result_round'], $fight['id']]);
-                    $this->settleBets((int) $fight['id'], $winner, (int) $eventId);
+                    $this->settleBets((int) $fight['id'], $winner, (string) $actual['method'], (int) $eventId);
                     $matched++;
                     break;
                 }
@@ -105,22 +105,15 @@ final class EventReviewService
         return $report;
     }
 
-    private function settleBets(int $fightId, string $winner, int $eventId): void
+    private function settleBets(int $fightId, string $winner, string $method, int $eventId): void
     {
         $pdo = $this->database->pdo();
         $stmt = $pdo->prepare('SELECT * FROM bets WHERE fight_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
         $stmt->execute([$fightId]);
         $update = $pdo->prepare('UPDATE bets SET result=?,profit=? WHERE id=?');
         foreach ($stmt->fetchAll() as $bet) {
-            $won = $bet['selection'] === $winner;
-            if ($won) {
-                $result = 'win';
-                $profit = (float) $bet['stake'] * ((float) $bet['odds'] - 1);
-            } else {
-                $result = 'loss';
-                $profit = -(float) $bet['stake'];
-            }
-            $update->execute([$result, round($profit, 2), $bet['id']]);
+            $settled = StakeMethodMarket::settleProfit($bet, $winner, $method);
+            $update->execute([$settled['result'], $settled['profit'], $bet['id']]);
         }
         if (!$this->fightOnOpenTicket($eventId, $fightId)) {
             $pred = $pdo->prepare('UPDATE predictions SET status="settled",profit=COALESCE((SELECT profit FROM bets WHERE owner="jev" AND fight_id=? AND market NOT IN ("kombinacija","sistem") ORDER BY id DESC LIMIT 1),0) WHERE fight_id=? AND status="open"');

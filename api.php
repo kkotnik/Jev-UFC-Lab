@@ -21,7 +21,7 @@ try {
         }
         $fightStmt = $pdo->prepare(<<<'SQL'
 SELECT f.*, p.id prediction_id, p.winner_pick, p.p_a, p.p_b, p.confidence, p.method_pick,
-       p.recommended_bet, p.recommended_odds, p.edge, p.stake prediction_stake,
+       p.method_probs_json, p.recommended_bet, p.recommended_odds, p.edge, p.stake prediction_stake,
        p.created_at prediction_created_at, p.status prediction_status,
        CASE WHEN p.raw_json LIKE '%pre_fight_enrichment%' THEN 1 ELSE 0 END prediction_enriched
 FROM fights f
@@ -33,6 +33,23 @@ SQL);
         foreach ($fights as &$fight) {
             foreach (['odds_a','odds_b','p_a','p_b','confidence','recommended_odds','edge','prediction_stake'] as $field) {
                 $fight[$field] = $fight[$field] === null ? null : (float) $fight[$field];
+            }
+            $rawMethodProbs = json_decode((string) ($fight['method_probs_json'] ?? ''), true);
+            if (!is_array($rawMethodProbs) || $rawMethodProbs === []) {
+                $fight['method_probs'] = [];
+            } else {
+                $fight['method_probs'] = StakeMethodMarket::normalizeProbs($rawMethodProbs);
+            }
+            unset($fight['method_probs_json']);
+            $fight['method_markets'] = [];
+            if ($fight['prediction_id'] != null && $fight['odds_a'] !== null && $fight['odds_b'] !== null && $fight['method_probs'] !== []) {
+                foreach (StakeMethodMarket::keys() as $key) {
+                    $methodOdds = StakeMethodMarket::syntheticMethodOdds((float) $fight['odds_a'], (float) $fight['odds_b'], $key);
+                    $option = StakeMethodMarket::optionFromKey($key, (string) $fight['fighter_a'], (string) $fight['fighter_b'], $fight['method_probs'], $methodOdds);
+                    if ($option !== null) {
+                        $fight['method_markets'][] = $option;
+                    }
+                }
             }
             $fight['prefight']=(new PreFightDataService($database))->getFightData((int)$fight['id'],false);
         }
@@ -61,6 +78,13 @@ SQL);
         $backtestService = new BacktestService($database);
         $backtestTicket = $backtestService->loadNamed(BacktestService::BATCH_NAME);
         $backtestSingle = $backtestService->loadNamed(BacktestService::SINGLES_BATCH_NAME);
+        $backtestSingleMethod = $backtestService->ensureMethodSinglesBacktest();
+        $activeName = '';
+        foreach ($events as $eventRow) {
+            if ((int) $eventRow['id'] === $eventId) {
+                $activeName = (string) $eventRow['name'];
+            }
+        }
         $history=[];
         $historyStmt=$pdo->query("SELECT * FROM events WHERE substr(event_date,1,10)<date('now') OR status!='upcoming' ORDER BY event_date DESC");
         $historyBetStmt=$pdo->prepare('SELECT b.*,f.fighter_a,f.fighter_b FROM bets b LEFT JOIN fights f ON f.id=b.fight_id WHERE b.event_id=? ORDER BY b.id');
@@ -74,6 +98,8 @@ SQL);
             'backtest' => $backtestTicket,
             'backtest_ticket' => $backtestTicket,
             'backtest_single' => $backtestSingle,
+            'backtest_single_method' => $backtestSingleMethod,
+            'stake_url' => StakeMethodMarket::eventUrl($activeName),
             'history' => $history,
             'settings' => [
                 'kelly_fraction' => $database->setting('kelly_fraction', .5),
@@ -133,14 +159,28 @@ SQL);
         $fightStmt = $pdo->prepare('SELECT * FROM fights WHERE id=? AND completed=0');
         $fightStmt->execute([$fightId]);
         $fight = $fightStmt->fetch();
-        if (!$fight || !in_array($selection, [$fight['fighter_a'], $fight['fighter_b']], true)) {
+        if (!$fight) {
+            throw new InvalidArgumentException('Izberi veljavnega borca.');
+        }
+        $market = 'moneyline';
+        $parsedMethod = StakeMethodMarket::parseSelection($selection);
+        if ($parsedMethod !== null) {
+            $market = StakeMethodMarket::MARKET;
+            $validFighter = false;
+            if ($parsedMethod['fighter'] === $fight['fighter_a'] || $parsedMethod['fighter'] === $fight['fighter_b']) {
+                $validFighter = true;
+            }
+            if (!$validFighter) {
+                throw new InvalidArgumentException('Izberi veljavnega borca in winning method.');
+            }
+        } else if (!in_array($selection, [$fight['fighter_a'], $fight['fighter_b']], true)) {
             throw new InvalidArgumentException('Izberi veljavnega borca.');
         }
         if ($odds <= 1 || $stake <= 0 || $stake > $service->availableBankroll('me')) {
             throw new InvalidArgumentException('Preveri kvoto, vložek in razpoložljiv bankroll.');
         }
-        $stmt = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"me",?,"moneyline",?,?)');
-        $stmt->execute([$fight['event_id'], $fightId, $selection, $odds, $stake]);
+        $stmt = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"me",?,?,?,?)');
+        $stmt->execute([$fight['event_id'], $fightId, $selection, $market, $odds, $stake]);
         json_response(['ok' => true]);
     }
 
@@ -162,15 +202,8 @@ SQL);
             $bets->execute([$fightId]);
             $settle = $pdo->prepare('UPDATE bets SET result=?,profit=? WHERE id=?');
             foreach ($bets->fetchAll() as $bet) {
-                $won = $bet['selection'] === $winner;
-                if ($won) {
-                    $result = 'win';
-                    $profit = (float) $bet['stake'] * ((float) $bet['odds'] - 1);
-                } else {
-                    $result = 'loss';
-                    $profit = -(float) $bet['stake'];
-                }
-                $settle->execute([$result, round($profit, 2), $bet['id']]);
+                $settled = StakeMethodMarket::settleProfit($bet, $winner, trim((string) ($input['method'] ?? '')));
+                $settle->execute([$settled['result'], $settled['profit'], $bet['id']]);
             }
             $onTicket = false;
             $ticketStmt = $pdo->prepare('SELECT selection FROM bets WHERE event_id=? AND owner="jev" AND market IN ("kombinacija","sistem") AND result="open" AND stake>0');

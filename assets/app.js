@@ -11,7 +11,22 @@
     var esc = function (value) { var div = document.createElement('div'); div.textContent = value == null ? '' : String(value); return div.innerHTML; };
     var euro = function (value) { return new Intl.NumberFormat('sl-SI', { style: 'currency', currency: 'EUR' }).format(Number(value || 0)); };
     var pct = function (value, digits) { return (Number(value || 0) * 100).toFixed(digits == null ? 1 : digits) + '%'; };
-    var sportsbookUrl = 'https://www.e-stave.com/stave';
+    function sportsbookUrl() {
+        if (state.mode === 'single') {
+            if (state.data && state.data.stake_url) {
+                return state.data.stake_url;
+            }
+            return 'https://stake.com/sports/mma/ufc';
+        }
+        return 'https://www.e-stave.com/stave';
+    }
+
+    function sportsbookLabel() {
+        if (state.mode === 'single') {
+            return 'Odpri Stake ↗';
+        }
+        return 'Odpri E-Stave ↗';
+    }
 
     function request(action, method, payload) {
         return new Promise(function (resolve, reject) {
@@ -83,6 +98,9 @@
             return null;
         }
         if (state.mode === 'single') {
+            if (state.data.backtest_single_method) {
+                return state.data.backtest_single_method;
+            }
             if (state.data.backtest_single) {
                 return state.data.backtest_single;
             }
@@ -107,19 +125,20 @@
         byId('modeTicket').className = '';
         if (single) {
             byId('modeSingle').className = 'active';
-            byId('ledeText').textContent = 'Jev stavi posamezne moneyline stave. Vsaka borba ima svoj vložek (½ Kelly). Edge mora biti vsaj 5 točk, confidence vsaj 55 %.';
+            byId('ledeText').textContent = 'Jev ti za vsako borbo pove, kaj zakleniti v dnevnik: moneyline ali Stake winning method. Method samo, če je na ta izid dovolj ziher (npr. decision 80 %+). Sicer samo zmagovalec.';
             byId('jevModeLabel').textContent = 'SINGLE BET';
             byId('betGuide').className = 'bet-guide single-mode';
-            byId('betGuideTitle').textContent = 'Single bet: vsaka borba posebej';
-            byId('betGuideA').innerHTML = '<b>Moneyline.</b> Jev izbere zmagovalca na kakršen koli način. Vložek vidiš na kartici. To je stari program: ena stava na borbo, ne listek.';
+            byId('betGuideTitle').textContent = 'Isto kot dnevnik: ena priporočena stava na borbo';
+            byId('betGuideA').innerHTML = '<b>Jev pove STAVI.</b> Moneyline = zmaga na kakršen koli način. Winning method = KO/TKO, Submission ali Decision. Če ni dovolj ziher na metodo, ostane moneyline. Draw ne stavimo.';
             byId('betGuideB').textContent = '';
-            byId('ledgerHint').textContent = 'Virtualni model ni zagotovilo dobička. Povezava odpre E-Stave, stave pa ne odda. Pred vplačilom preveri kvoto; samo 18+.';
-            byId('historyIntro').textContent = 'Zgodovina single betov: zaklenjene napovedi, tvoje in Jevove posamezne stave, rezultati ter P/L.';
-            byId('backtestIntro').textContent = 'Isti Jevovi picki. Vložek je posamezna moneyline stava (½ Kelly) na borbe z edgem ≥ 5 točk in confidence ≥ 55 %. Backtest je shranjen in Jeva ne kliče znova.';
-            byId('backtestH2').textContent = 'Single bet';
-            byId('backtestRules').innerHTML = '<span>moneyline</span><span>edge ≥ 5 točk</span><span>confidence ≥ 55 %</span><span>½ Kelly</span><span>max 15 % stava</span><span>max 35 % dogodek</span>';
-            byId('backtestBlurb').textContent = 'To je prejšnji program: samostojne stave, ne E-Stave listek.';
-            byId('predictAllButton').textContent = 'Analiziraj cel card + razporedi stave';
+            byId('ledgerHint').textContent = 'To so Jevove zaklenjene stave za ta dogodek — isto pravilo kot backtest po datumih. Povezava odpre Stake. Stave ne odda. 18+.';
+            byId('historyIntro').textContent = 'Zgodovina dnevnikov: samo zaklenjene stave, ne cel card.';
+            byId('backtestIntro').textContent = 'Vsak datum je en dogodek, kot da si tisti teden kliknil Analiziraj cel card. Vrstice so točno tiste, ki bi šle v Stavni dnevnik. Borbe brez stave niso v dnevniku.';
+            byId('backtestH2').textContent = 'Dnevnik po dogodkih';
+            byId('backtestRules').innerHTML = '<span>isti dnevnik</span><span>ne cel card</span><span>moneyline ali method</span><span>edge ≥ 5 točk</span><span>½ Kelly</span>';
+            byId('backtestBlurb').textContent = 'Odpri 27. 9. (ali drug datum): to je tedenski dnevnik, ne seznam vseh borb.';
+            byId('predictAllButton').textContent = 'Analiziraj cel card + napolni dnevnik';
+            byId('ledgerPickHead').textContent = 'Jev priporočilo';
         } else {
             byId('modeTicket').className = 'active';
             byId('ledeText').textContent = 'Jev sestavi en E-Stave listek na dogodek: sistem 2/3 pri treh kandidatih, kombinacija pri dveh. Pove, koliko vplačati. Ena noga na sistemu sme pasti.';
@@ -135,6 +154,7 @@
             byId('backtestRules').innerHTML = '<span>sistem 2/3</span><span>kombinacija 2</span><span>edge ≥ 5 točk</span><span>confidence ≥ 55 %</span><span>½ Kelly</span>';
             byId('backtestBlurb').textContent = 'Če ni vsaj dveh kandidatov, dogodek nima listka. Primerjava s starimi posameznimi stavami je na istem Jevovem researchu.';
             byId('predictAllButton').textContent = 'Analiziraj cel card + sestavi listek';
+            byId('ledgerPickHead').textContent = 'Izbor';
         }
     }
 
@@ -243,7 +263,10 @@
             if (ticket.type === 'sistem') return ticket.label + ' (sistem 2/3)';
             return ticket.label + ' (kombinacija)';
         }
-        return bet.selection + ' zmaga';
+        if (bet.market === 'winning_method') {
+            return 'STAVI METHOD: ' + bet.selection;
+        }
+        return 'STAVI MONEYLINE: ' + bet.selection + ' zmaga';
     }
 
     function ticketByFight(bets) {
@@ -280,6 +303,26 @@
         return map;
     }
 
+    function renderMethodMarkets(fight) {
+        if (state.mode !== 'single') {
+            return ' <small>(ločeno od moneyline stave)</small>';
+        }
+        var markets = fight.method_markets || [];
+        if (!markets.length) {
+            return ' <small>Stake winning method: KO/TKO · Submission · Decision. Preveri kvoto na Stake.</small>';
+        }
+        var html = '<div class="method-markets">';
+        markets.forEach(function (market) {
+            var cls = '';
+            if (Number(market.edge) >= Number(state.data.settings.min_edge || 0.05)) {
+                cls = ' has-edge';
+            }
+            html += '<span class="method-chip' + cls + '"><b>' + esc(market.selection) + '</b> ' + Number(market.odds).toFixed(2) + ' · Jev ' + pct(market.p) + '</span>';
+        });
+        html += '</div><small>Ocenjene Stake method kvote (+18 % juice). Pred vplačilom preveri na Stake.</small>';
+        return html;
+    }
+
     function renderFights(fights) {
         if (!fights.length) { byId('fightList').innerHTML = '<div class="empty">Card še ni objavljen ali ga ni bilo mogoče uvoziti. Lahko ga dodaš ročno.</div>'; return; }
         var onTicket = ticketByFight(state.data.bets);
@@ -305,13 +348,26 @@
                     if (singleBet.selection === fight.fighter_b) {
                         probability = Number(fight.p_b);
                     }
+                    if (singleBet.market === 'winning_method') {
+                        probability = Number(fight.confidence);
+                        (fight.method_markets || []).forEach(function (market) {
+                            if (market.selection === singleBet.selection) {
+                                probability = Number(market.p);
+                            }
+                        });
+                    }
                     var odds = Number(singleBet.odds);
                     var stake = Number(singleBet.stake);
                     var implied = 1 / odds;
                     var edgePts = (probability - implied) * 100;
-                    betHtml = '<div class="bet-call"><strong>MONEYLINE: ' + esc(singleBet.selection) + ' zmaga na kakršen koli način</strong>' +
+                    var title = 'STAVI MONEYLINE: ' + esc(singleBet.selection) + ' zmaga';
+                    if (singleBet.market === 'winning_method') {
+                        title = 'STAVI METHOD: ' + esc(singleBet.selection);
+                    }
+                    betHtml = '<div class="bet-call"><strong>' + title + '</strong>' +
                         '<small>Vložek ' + euro(stake) + ' · kvota ' + odds.toFixed(2) + ' · možno izplačilo ' + euro(stake * odds) + ' · možni čisti dobiček ' + euro(stake * (odds - 1)) + '</small>' +
-                        '<small>Jev ' + pct(probability) + ' proti tržnih ' + pct(implied) + ' → edge +' + edgePts.toFixed(1) + ' odstotne točke</small></div>';
+                        '<small>Jev ' + pct(probability) + ' proti tržnih ' + pct(implied) + ' → edge +' + edgePts.toFixed(1) + ' odstotne točke</small>' +
+                        '<a class="sportsbook-link" href="' + sportsbookUrl() + '" target="_blank" rel="noopener noreferrer nofollow">Odpri Stake ↗</a></div>';
                 }
             }
             var prefight = renderPrefight(fight);
@@ -320,7 +376,7 @@
                 analysis = '<div class="prob-head"><b>Jev izbere: ' + esc(fight.winner_pick) + '</b><span class="confidence">confidence ' + pct(fight.confidence) + '</span></div>' +
                     '<div class="prob-line"><span>' + esc(fight.fighter_a) + '</span><div class="bar"><i style="width:' + (fight.p_a * 100) + '%"></i></div><b>' + pct(fight.p_a, 0) + '</b></div>' +
                     '<div class="prob-line second"><span>' + esc(fight.fighter_b) + '</span><div class="bar"><i style="width:' + (fight.p_b * 100) + '%"></i></div><b>' + pct(fight.p_b, 0) + '</b></div>' +
-                    '<div class="method">Napoved načina zaključka: <b>' + esc(fight.method_pick) + '</b> <small>(ločeno od moneyline stave)</small></div>' + betHtml;
+                    '<div class="method">Napoved načina zaključka: <b>' + esc(fight.method_pick) + '</b>' + renderMethodMarkets(fight) + '</div>' + betHtml;
             } else {
                 analysis = '<div class="awaiting">Jev še ni analiziral borbe. Najprej preveri kvote in sinhroniziraj zgodovino.</div>';
             }
@@ -405,7 +461,7 @@
                 legs +
                 totals +
                 '<p class="estave-steps">' + steps + '</p>' +
-                '<p><a class="sportsbook-link" href="' + sportsbookUrl + '" target="_blank" rel="noopener noreferrer nofollow">Odpri E-Stave ↗</a></p></article>';
+                '<p><a class="sportsbook-link" href="' + sportsbookUrl() + '" target="_blank" rel="noopener noreferrer nofollow">' + sportsbookLabel() + '</a></p></article>';
         });
         if (html === '') {
             wrap.hidden = true;
@@ -432,7 +488,7 @@
             if (bet.profit > 0) profitPrefix = '+';
             var link = '';
             if (bet.owner === 'jev' && bet.result === 'open') {
-                link = '<a class="sportsbook-link" href="' + sportsbookUrl + '" target="_blank" rel="noopener noreferrer nofollow" title="Preveri izbor in trenutno kvoto pred vplačilom">Odpri E-Stave ↗</a>';
+                link = '<a class="sportsbook-link" href="' + sportsbookUrl() + '" target="_blank" rel="noopener noreferrer nofollow" title="Preveri izbor in trenutno kvoto pred vplačilom">' + sportsbookLabel() + '</a>';
             }
             return '<tr><td><span class="pill ' + esc(bet.owner) + '">' + owner + '</span></td><td>' + esc(betLabel(bet)) + '</td><td>' + Number(bet.odds).toFixed(2) + '</td><td>' + euro(bet.stake) + '</td><td>' + esc(bet.result) + '</td><td class="' + profitClass + '">' + profitPrefix + euro(bet.profit) + '</td><td>' + link + '</td></tr>';
         }).join('');
@@ -466,6 +522,16 @@
             button.classList.remove('locked');
             return;
         }
+        var winnerOnly = test.winner_only || null;
+        var locked = test.winner_only_locked || null;
+        if (!locked && state.data.backtest_single) {
+            locked = {
+                profit: state.data.backtest_single.profit,
+                total_stake: state.data.backtest_single.total_stake,
+                ending_bankroll: state.data.backtest_single.risk ? state.data.backtest_single.risk.ending_bankroll : 0,
+                bet_count: state.data.backtest_single.bet_count || 0
+            };
+        }
         var jevRoi = 0;
         if (Number(test.total_stake)) {
             jevRoi = Number(test.profit) / Number(test.total_stake);
@@ -482,33 +548,54 @@
             grouped[row.event_date].push(row);
         });
         var events = (test.event_summaries || []).map(function (event) {
-            var rows = (grouped[event.event_date] || []).map(function (row) {
-                var placed = Number(row.stake) > 0;
-                var won = placed && Number(row.bet_profit) >= 0;
-                var rowClass = 'backtest-bet';
-                if (!placed) {
-                    rowClass = 'backtest-bet skipped';
-                }
-                var stakeLabel = 'BREZ STAVE';
-                if (placed) {
-                    stakeLabel = euro(row.stake);
-                }
-                var resultClass = '';
-                var resultLabel = 'SKIP';
-                if (placed) {
-                    if (won) {
-                        resultClass = 'correct';
-                    } else {
-                        resultClass = 'wrong';
+            var ledgerRows = [];
+            if (event.ledger && event.ledger.length) {
+                ledgerRows = event.ledger;
+            } else {
+                (grouped[event.event_date] || []).forEach(function (row) {
+                    if (Number(row.stake) <= 0 || !row.bet) {
+                        return;
+                    }
+                    var result = 'loss';
+                    if (Number(row.bet_profit) >= 0) {
+                        result = 'win';
+                    }
+                    ledgerRows.push({
+                        advice: betLabel({ market: row.bet.market || 'moneyline', selection: row.bet.selection }),
+                        fight: row.fighter_a + ' vs ' + row.fighter_b,
+                        odds: row.bet.odds,
+                        stake: row.stake,
+                        result: result,
+                        profit: row.bet_profit,
+                        actual: row.actual_winner + ' · ' + row.actual_method,
+                        reason: row.reason || ''
+                    });
+                });
+            }
+            var table = '<p class="history-empty">Ta teden dnevnik prazen — Jev ni zaklenil stave.</p>';
+            if (ledgerRows.length) {
+                table = '<div class="table-wrap history-bets"><table><thead><tr><th>Jev priporočilo</th><th>Borba</th><th>Kvota</th><th>Vložek</th><th>Izid</th><th>P/L</th></tr></thead><tbody>';
+                ledgerRows.forEach(function (bet) {
+                    var plClass = 'loss';
+                    if (Number(bet.profit) >= 0) {
+                        plClass = 'win';
                     }
                     var prefix = '';
-                    if (Number(row.bet_profit) >= 0) {
+                    if (Number(bet.profit) >= 0) {
                         prefix = '+';
                     }
-                    resultLabel = prefix + euro(row.bet_profit);
-                }
-                return '<div class="' + rowClass + '"><div><b>' + esc(row.bet.selection) + '</b><small>' + esc(row.fighter_a + ' vs ' + row.fighter_b) + '</small><small>rezultat: ' + esc(row.actual_winner) + ' · ' + esc(row.actual_method) + '</small></div><span>kvota <b>' + Number(row.bet.odds).toFixed(2) + '</b></span><span>Jev <b>' + pct(row.bet.p) + '</b></span><span>edge <b>' + (Number(row.bet.edge) * 100).toFixed(1) + ' t.</b></span><span>vložek <b>' + stakeLabel + '</b></span><strong class="' + resultClass + '">' + resultLabel + '</strong></div>';
-            }).join('');
+                    var izid = 'PADLA';
+                    if (bet.result === 'win') {
+                        izid = 'ZADETA';
+                    }
+                    table += '<tr><td><b>' + esc(bet.advice) + '</b></td><td>' + esc(bet.fight) + '<br><small>' + esc(bet.actual || '') + '</small></td><td>' + Number(bet.odds).toFixed(2) + '</td><td>' + euro(bet.stake) + '</td><td>' + izid + '</td><td class="' + plClass + '">' + prefix + euro(bet.profit) + '</td></tr>';
+                });
+                table += '</tbody></table></div>';
+            }
+            var skippedNote = '';
+            if (Number(event.skipped) > 0) {
+                skippedNote = '<p class="wager-warning">' + event.skipped + ' borb ni šlo v dnevnik (premalo edge/confidence). Niso stave.</p>';
+            }
             var eventPrefix = '';
             if (Number(event.profit) >= 0) {
                 eventPrefix = '+';
@@ -517,7 +604,7 @@
             if (Number(event.profit) >= 0) {
                 eventClass = 'correct';
             }
-            return '<details class="backtest-event"><summary><span><b>' + new Date(event.event_date).toLocaleDateString('sl-SI') + '</b><small>' + esc(event.location) + '</small></span><span>stave <b>' + event.bets + '/' + event.total_fights + '</b></span><span>vložek <b>' + euro(event.stake) + '</b></span><span>P/L <b class="' + eventClass + '">' + eventPrefix + euro(event.profit) + '</b></span></summary><div>' + rows + '</div></details>';
+            return '<details class="backtest-event"><summary><span><b>' + new Date(event.event_date).toLocaleDateString('sl-SI') + '</b><small>dnevnik · ' + esc(event.location) + '</small></span><span>v dnevniku <b>' + event.bets + '</b></span><span>vložek <b>' + euro(event.stake) + '</b></span><span>P/L <b class="' + eventClass + '">' + eventPrefix + euro(event.profit) + '</b></span></summary><div class="history-content">' + table + skippedNote + '</div></details>';
         }).join('');
         var profitPrefix = '';
         if (Number(test.profit) >= 0) {
@@ -533,10 +620,42 @@
             favProfit = test.favorite.profit;
             favStake = test.favorite.total_stake;
         }
-        byId('backtestReport').innerHTML = reportSummary([['Dogodki', test.event_count], ['Vse borbe', test.total_fights], ['Dejanske stave', test.bet_count], ['Pravilni zmagovalci', test.correct_winner + '/' + test.total_fights], ['Pravilna metoda', test.correct_method + '/' + test.total_fights], ['Preskočene', test.skipped_count], ['Profit', profitPrefix + euro(test.profit)], ['ROI', pct(jevRoi)], ['Brier', Number(test.brier).toFixed(3)]]) +
-            '<div class="strategy-compare two"><article><small>JEV: SINGLE BET</small><b>' + profitPrefix + euro(test.profit) + '</b><span>' + euro(test.total_stake) + ' vložka · ROI ' + pct(jevRoi) + ' · ' + test.skipped_count + ' preskočenih</span></article><article><small>BENCHMARK: VEDNO FAVORIT</small><b>' + favPrefix + euro(favProfit) + '</b><span>' + euro(favStake) + ' vložka · ROI ' + pct(favoriteRoi) + '</span></article></div>' +
+        var compareHtml = '';
+        if (winnerOnly) {
+            var winnerPrefix = '';
+            if (Number(winnerOnly.profit) >= 0) {
+                winnerPrefix = '+';
+            }
+            var methodPrefix = '';
+            if (Number(test.profit) >= 0) {
+                methodPrefix = '+';
+            }
+            var lockedHtml = '';
+            if (locked) {
+                var lockedPrefix = '';
+                if (Number(locked.profit) >= 0) {
+                    lockedPrefix = '+';
+                }
+                lockedHtml = '<article><small>SHRANJEN: SAMO ZMAGOVALEC</small><b>' + lockedPrefix + euro(locked.profit) + '</b><span>' + euro(locked.total_stake) + ' vložka · ' + (locked.bet_count || '—') + ' stav · ni spremenjen</span></article>';
+            }
+            compareHtml = '<div class="strategy-compare">' + lockedHtml +
+                '<article><small>ISTI PICKI: SAMO ZMAGOVALEC</small><b>' + winnerPrefix + euro(winnerOnly.profit) + '</b><span>' + euro(winnerOnly.total_stake) + ' vložka · ROI ' + pct(winnerOnly.roi || 0) + ' · ' + winnerOnly.bet_count + ' stav</span></article>' +
+                '<article><small>JEV: ZMAGOVALEC ALI WINNING METHOD</small><b>' + methodPrefix + euro(test.profit) + '</b><span>' + euro(test.total_stake) + ' vložka · ROI ' + pct(jevRoi) + ' · method ' + (test.method_bet_count || 0) + ' / moneyline ' + (test.moneyline_bet_count || 0) + '</span></article></div>';
+        } else {
+            compareHtml = '<div class="strategy-compare two"><article><small>JEV: SINGLE BET</small><b>' + profitPrefix + euro(test.profit) + '</b><span>' + euro(test.total_stake) + ' vložka · ROI ' + pct(jevRoi) + ' · ' + test.skipped_count + ' preskočenih</span></article><article><small>BENCHMARK: VEDNO FAVORIT</small><b>' + favPrefix + euro(favProfit) + '</b><span>' + euro(favStake) + ' vložka · ROI ' + pct(favoriteRoi) + '</span></article></div>';
+        }
+        var policyNote = '<p class="legacy-note">Vsak datum = en tedenski Stavni dnevnik. Vrstice so samo zaklenjene stave, ne cel fight card.</p>';
+        if (test.policy) {
+            policyNote = '<p class="legacy-note">Isto pravilo kot gumb Napolni dnevnik: method samo če je Jev dovolj ziher na KO/Sub/Dec, sicer moneyline. Odpri datum — to so vrstice dnevnika.</p>';
+        }
+        byId('backtestReport').innerHTML = reportSummary([['Dogodki', test.event_count], ['Vrstice v dnevnikih', test.bet_count], ['Borbe na cardih', test.total_fights], ['Preskočene (niso v dnevniku)', test.skipped_count], ['Profit dnevnikov', profitPrefix + euro(test.profit)], ['ROI', pct(jevRoi)], ['Brier', Number(test.brier).toFixed(3)]]) +
+            compareHtml + policyNote +
             reportSummary([['Končni bankroll', euro(test.risk.ending_bankroll)], ['Max. drawdown', euro(test.risk.max_drawdown) + ' · ' + pct(test.risk.max_drawdown_pct)], ['Najdaljša serija porazov', test.risk.max_loss_streak]]) + '<div class="backtest-events">' + events + '</div>';
-        button.textContent = 'Single bet backtest je zaklenjen';
+        if (Number(test.version || 1) >= 7) {
+            button.textContent = 'Single + winning method backtest je zaklenjen';
+        } else {
+            button.textContent = 'Single bet backtest je zaklenjen';
+        }
         button.disabled = true;
         button.classList.add('locked');
     }
@@ -653,8 +772,22 @@
     function showFightDialog(name, id) {
         var fight = fightById(id), prefix = name === 'bet' ? 'bet' : 'settle'; byId(prefix + 'FightId').value = id;
         var select = byId(name === 'bet' ? 'betSelection' : 'settleWinner');
-        select.innerHTML = '<option>' + esc(fight.fighter_a) + '</option><option>' + esc(fight.fighter_b) + '</option>';
-        if (name === 'bet') byId('betOdds').value = fight.odds_a ? Number(fight.odds_a).toFixed(2) : '';
+        if (name === 'bet') {
+            var html = '<option value="' + esc(fight.fighter_a) + '">' + esc(fight.fighter_a) + ' zmaga (moneyline)</option><option value="' + esc(fight.fighter_b) + '">' + esc(fight.fighter_b) + ' zmaga (moneyline)</option>';
+            if (state.mode === 'single') {
+                (fight.method_markets || []).forEach(function (market) {
+                    html += '<option value="' + esc(market.selection) + '" data-odds="' + Number(market.odds).toFixed(2) + '">' + esc(market.selection) + '</option>';
+                });
+            }
+            select.innerHTML = html;
+            if (fight.odds_a) {
+                byId('betOdds').value = Number(fight.odds_a).toFixed(2);
+            } else {
+                byId('betOdds').value = '';
+            }
+        } else {
+            select.innerHTML = '<option>' + esc(fight.fighter_a) + '</option><option>' + esc(fight.fighter_b) + '</option>';
+        }
         byId(name + 'Modal').showModal();
     }
 
@@ -728,7 +861,7 @@
                 completed = !!result.complete;
                 if (completed) {
                     if (state.mode === 'single') {
-                        state.data.backtest_single = result.backtest;
+                        state.data.backtest_single_method = result.backtest;
                     } else {
                         state.data.backtest_ticket = result.backtest;
                         state.data.backtest = result.backtest;
@@ -737,7 +870,7 @@
                     progress.querySelector('span').textContent = '20/20 dogodkov';
                     progress.querySelector('i').style.width = '100%';
                     if (state.mode === 'single') {
-                        toast('Single bet backtest je prikazan.');
+                        toast('Single + winning method backtest je primerjan z winner-only.');
                     } else {
                         toast('E-Stave listek backtest je zaključen in zaklenjen.');
                     }
@@ -761,7 +894,19 @@
             }
         }
     });
-    byId('betSelection').addEventListener('change', function () { var fight = fightById(byId('betFightId').value); byId('betOdds').value = this.value === fight.fighter_a ? (fight.odds_a || '') : (fight.odds_b || ''); });
+    byId('betSelection').addEventListener('change', function () {
+        var fight = fightById(byId('betFightId').value);
+        var selected = this.options[this.selectedIndex];
+        if (selected && selected.getAttribute('data-odds')) {
+            byId('betOdds').value = selected.getAttribute('data-odds');
+            return;
+        }
+        if (this.value === fight.fighter_a) {
+            byId('betOdds').value = fight.odds_a || '';
+        } else {
+            byId('betOdds').value = fight.odds_b || '';
+        }
+    });
     byId('saveSettings').addEventListener('click', function () { var key = byId('apiKeyInput').value.trim(), oddsKey = byId('oddsKeyInput').value.trim(); if (key) sessionStorage.setItem('typesafeKey', key); if (oddsKey) sessionStorage.setItem('oddsKey', oddsKey); request('settings', 'POST', { kelly_fraction: byId('kellyInput').value, max_bet_fraction: byId('maxBetInput').value / 100, max_event_fraction: byId('maxEventInput').value / 100, min_edge: byId('minEdgeInput').value / 100 }).then(function () { byId('settingsModal').close(); toast('Strategija shranjena.'); load(); }).catch(function (error) { toast(error.message, true); }); });
     byId('saveBet').addEventListener('click', function () { request('my_bet', 'POST', { fight_id: byId('betFightId').value, selection: byId('betSelection').value, odds: byId('betOdds').value, stake: byId('betStake').value }).then(function () { byId('betModal').close(); toast('Tvoja stava je zaklenjena.'); load(); }).catch(function (error) { toast(error.message, true); }); });
     byId('saveResult').addEventListener('click', function () { request('settle_fight', 'POST', { fight_id: byId('settleFightId').value, winner: byId('settleWinner').value, method: byId('settleMethod').value, round: byId('settleRound').value }).then(function () { byId('settleModal').close(); toast('Rezultat poravnan.'); load(); }).catch(function (error) { toast(error.message, true); }); });
