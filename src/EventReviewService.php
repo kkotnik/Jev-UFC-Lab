@@ -43,7 +43,7 @@ final class EventReviewService
                     $winner = $this->normalize($actual['winner']) === $this->normalize($fight['fighter_a']) ? $fight['fighter_a'] : $fight['fighter_b'];
                     $update = $pdo->prepare('UPDATE fights SET winner=?,method=?,result_round=?,completed=1 WHERE id=?');
                     $update->execute([$winner, $actual['method'], $actual['result_round'], $fight['id']]);
-                    $this->settleBets((int) $fight['id'], $winner);
+                    $this->settleBets((int) $fight['id'], $winner, (int) $eventId);
                     $matched++;
                     break;
                 }
@@ -105,18 +105,47 @@ final class EventReviewService
         return $report;
     }
 
-    private function settleBets(int $fightId, string $winner): void
+    private function settleBets(int $fightId, string $winner, int $eventId): void
     {
-        $stmt = $this->database->pdo()->prepare('SELECT * FROM bets WHERE fight_id=? AND result="open"');
+        $pdo = $this->database->pdo();
+        $stmt = $pdo->prepare('SELECT * FROM bets WHERE fight_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
         $stmt->execute([$fightId]);
-        $update = $this->database->pdo()->prepare('UPDATE bets SET result=?,profit=? WHERE id=?');
+        $update = $pdo->prepare('UPDATE bets SET result=?,profit=? WHERE id=?');
         foreach ($stmt->fetchAll() as $bet) {
             $won = $bet['selection'] === $winner;
-            $profit = $won ? (float) $bet['stake'] * ((float) $bet['odds'] - 1) : -(float) $bet['stake'];
-            $update->execute([$won ? 'win' : 'loss', round($profit, 2), $bet['id']]);
+            if ($won) {
+                $result = 'win';
+                $profit = (float) $bet['stake'] * ((float) $bet['odds'] - 1);
+            } else {
+                $result = 'loss';
+                $profit = -(float) $bet['stake'];
+            }
+            $update->execute([$result, round($profit, 2), $bet['id']]);
         }
-        $pred = $this->database->pdo()->prepare('UPDATE predictions SET status="settled",profit=COALESCE((SELECT profit FROM bets WHERE owner="jev" AND fight_id=? ORDER BY id DESC LIMIT 1),0) WHERE fight_id=? AND status="open"');
-        $pred->execute([$fightId, $fightId]);
+        if (!$this->fightOnOpenTicket($eventId, $fightId)) {
+            $pred = $pdo->prepare('UPDATE predictions SET status="settled",profit=COALESCE((SELECT profit FROM bets WHERE owner="jev" AND fight_id=? AND market NOT IN ("kombinacija","sistem") ORDER BY id DESC LIMIT 1),0) WHERE fight_id=? AND status="open"');
+            $pred->execute([$fightId, $fightId]);
+        }
+        (new EstaveTicketService())->settleOpenTickets($pdo, $eventId);
+    }
+
+    private function fightOnOpenTicket(int $eventId, int $fightId): bool
+    {
+        $stmt = $this->database->pdo()->prepare('SELECT selection FROM bets WHERE event_id=? AND owner="jev" AND market IN ("kombinacija","sistem") AND result="open" AND stake>0');
+        $stmt->execute([$eventId]);
+        $engine = new EstaveTicketService();
+        foreach ($stmt->fetchAll() as $bet) {
+            $ticket = $engine->parseSelection((string) $bet['selection']);
+            if ($ticket === null) {
+                continue;
+            }
+            foreach ($ticket['legs'] as $leg) {
+                if ((int) $leg['fight_id'] === $fightId) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private function samePair(array $fight, array $actual): bool

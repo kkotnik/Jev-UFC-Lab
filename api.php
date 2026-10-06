@@ -40,18 +40,11 @@ SQL);
         $betsStmt = $pdo->prepare('SELECT b.*, f.fighter_a, f.fighter_b FROM bets b LEFT JOIN fights f ON f.id=b.fight_id WHERE b.event_id=? ORDER BY b.id DESC');
         $betsStmt->execute([$eventId]);
         $bets = $betsStmt->fetchAll();
-        $metrics = [];
-        foreach (['jev', 'me'] as $owner) {
-            $metricStmt = $pdo->prepare("SELECT COUNT(*) total, SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) wins, SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) losses, COALESCE(SUM(CASE WHEN result!='open' THEN stake ELSE 0 END),0) settled_stake, COALESCE(SUM(profit),0) profit FROM bets WHERE owner=?");
-            $metricStmt->execute([$owner]);
-            $row = $metricStmt->fetch();
-            $settledStake = (float) $row['settled_stake'];
-            $metrics[$owner] = [
-                'bankroll' => $service->bankroll($owner), 'available' => $service->availableBankroll($owner),
-                'total_bets' => (int) $row['total'], 'wins' => (int) $row['wins'], 'losses' => (int) $row['losses'],
-                'profit' => (float) $row['profit'], 'roi' => $settledStake > 0 ? (float) $row['profit'] / $settledStake : 0,
-            ];
-        }
+        $metrics = [
+            'me' => $service->ownerMetrics('me'),
+            'jev_single' => $service->ownerMetrics('jev', 'single'),
+            'jev_ticket' => $service->ownerMetrics('jev', 'ticket'),
+        ];
         $settled = $pdo->query('SELECT p.p_a,f.fighter_a,f.winner FROM predictions p JOIN fights f ON f.id=p.fight_id WHERE f.completed=1 AND f.winner IS NOT NULL')->fetchAll();
         $brier = null;
         if ($settled) {
@@ -65,10 +58,9 @@ SQL);
         $reportStmt = $pdo->prepare('SELECT report_json FROM event_reports WHERE event_id=? ORDER BY id DESC LIMIT 1');
         $reportStmt->execute([$eventId]);
         $reportJson = $reportStmt->fetchColumn();
-        $backtest = $pdo->query('SELECT * FROM backtest_runs ORDER BY id DESC LIMIT 1')->fetch();
-        if ($backtest) {
-            $backtest = (new BacktestService($database))->hydrate($backtest);
-        }
+        $backtestService = new BacktestService($database);
+        $backtestTicket = $backtestService->loadNamed(BacktestService::BATCH_NAME);
+        $backtestSingle = $backtestService->loadNamed(BacktestService::SINGLES_BATCH_NAME);
         $history=[];
         $historyStmt=$pdo->query("SELECT * FROM events WHERE substr(event_date,1,10)<date('now') OR status!='upcoming' ORDER BY event_date DESC");
         $historyBetStmt=$pdo->prepare('SELECT b.*,f.fighter_a,f.fighter_b FROM bets b LEFT JOIN fights f ON f.id=b.fight_id WHERE b.event_id=? ORDER BY b.id');
@@ -79,7 +71,9 @@ SQL);
             'metrics' => $metrics, 'history_count' => (int) $pdo->query('SELECT COUNT(*) FROM historical_fights')->fetchColumn(),
             'brier' => $brier, 'api_configured' => (string) getenv('TYPESAFE_API_KEY') !== '',
             'event_report' => $reportJson ? json_decode((string)$reportJson, true) : null,
-            'backtest' => $backtest ?: null,
+            'backtest' => $backtestTicket,
+            'backtest_ticket' => $backtestTicket,
+            'backtest_single' => $backtestSingle,
             'history' => $history,
             'settings' => [
                 'kelly_fraction' => $database->setting('kelly_fraction', .5),
@@ -109,7 +103,11 @@ SQL);
     }
 
     if ($action === 'finalize_portfolio') {
-        json_response(['ok'=>true,'portfolio'=>$service->finalizeEventPortfolio((int)($input['event_id'] ?? 0))]);
+        $mode = (string) ($input['mode'] ?? 'ticket');
+        if ($mode !== 'single') {
+            $mode = 'ticket';
+        }
+        json_response(['ok'=>true,'portfolio'=>$service->finalizeEventPortfolio((int)($input['event_id'] ?? 0), $mode)]);
     }
 
     if ($action === 'complete_event') {
@@ -120,7 +118,11 @@ SQL);
     if ($action === 'run_backtest') {
         set_time_limit(600);
         $apiKey = trim((string) ($_SERVER['HTTP_X_TYPESAFE_KEY'] ?? getenv('TYPESAFE_API_KEY') ?: ''));
-        json_response(['ok'=>true]+(new BacktestService($database))->step($apiKey));
+        $mode = (string) ($input['mode'] ?? 'ticket');
+        if ($mode !== 'single') {
+            $mode = 'ticket';
+        }
+        json_response(['ok'=>true]+(new BacktestService($database))->step($apiKey, $mode));
     }
 
     if ($action === 'my_bet') {
@@ -156,16 +158,40 @@ SQL);
             $update = $pdo->prepare('UPDATE fights SET winner=?,method=?,result_round=?,completed=1 WHERE id=?');
             $round = (int) ($input['round'] ?? 0);
             $update->execute([$winner, trim((string) ($input['method'] ?? '')), $round > 0 ? $round : null, $fightId]);
-            $bets = $pdo->prepare('SELECT * FROM bets WHERE fight_id=? AND result="open"');
+            $bets = $pdo->prepare('SELECT * FROM bets WHERE fight_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
             $bets->execute([$fightId]);
             $settle = $pdo->prepare('UPDATE bets SET result=?,profit=? WHERE id=?');
             foreach ($bets->fetchAll() as $bet) {
                 $won = $bet['selection'] === $winner;
-                $profit = $won ? (float) $bet['stake'] * ((float) $bet['odds'] - 1) : -(float) $bet['stake'];
-                $settle->execute([$won ? 'win' : 'loss', round($profit, 2), $bet['id']]);
+                if ($won) {
+                    $result = 'win';
+                    $profit = (float) $bet['stake'] * ((float) $bet['odds'] - 1);
+                } else {
+                    $result = 'loss';
+                    $profit = -(float) $bet['stake'];
+                }
+                $settle->execute([$result, round($profit, 2), $bet['id']]);
             }
-            $pred = $pdo->prepare('UPDATE predictions SET status="settled", profit=COALESCE((SELECT profit FROM bets WHERE owner="jev" AND fight_id=? ORDER BY id DESC LIMIT 1),0) WHERE fight_id=? AND status="open"');
-            $pred->execute([$fightId, $fightId]);
+            $onTicket = false;
+            $ticketStmt = $pdo->prepare('SELECT selection FROM bets WHERE event_id=? AND owner="jev" AND market IN ("kombinacija","sistem") AND result="open" AND stake>0');
+            $ticketStmt->execute([(int) $fight['event_id']]);
+            $ticketEngine = new EstaveTicketService();
+            foreach ($ticketStmt->fetchAll() as $ticketBet) {
+                $ticket = $ticketEngine->parseSelection((string) $ticketBet['selection']);
+                if ($ticket === null) {
+                    continue;
+                }
+                foreach ($ticket['legs'] as $leg) {
+                    if ((int) $leg['fight_id'] === $fightId) {
+                        $onTicket = true;
+                    }
+                }
+            }
+            if (!$onTicket) {
+                $pred = $pdo->prepare('UPDATE predictions SET status="settled", profit=COALESCE((SELECT profit FROM bets WHERE owner="jev" AND fight_id=? AND market NOT IN ("kombinacija","sistem") ORDER BY id DESC LIMIT 1),0) WHERE fight_id=? AND status="open"');
+                $pred->execute([$fightId, $fightId]);
+            }
+            $ticketEngine->settleOpenTickets($pdo, (int) $fight['event_id']);
             $pdo->commit();
         } catch (Throwable $throwable) {
             $pdo->rollBack();

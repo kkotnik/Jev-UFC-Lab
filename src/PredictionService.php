@@ -127,15 +127,9 @@ SQL);
                 json_encode(['state' => $state, 'response' => $response], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
                 $winnerPick, $pA, $pB, $confidence, $methodPick,
                 json_encode($method['probabilities'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
-                $recommendation['selection'], $recommendation['odds'], $recommendation['edge'], $recommendation['stake'],
+                $recommendation['selection'], $recommendation['odds'], $recommendation['edge'], 0.0,
             ]);
             $predictionId = (int) $pdo->lastInsertId();
-            $openBets=$pdo->prepare('SELECT id FROM bets WHERE owner="jev" AND fight_id=? AND result="open" ORDER BY id DESC');$openBets->execute([$fightId]);$betIds=array_map('intval',array_column($openBets->fetchAll(),'id'));
-            if($betIds){$zero=$pdo->prepare('UPDATE bets SET stake=0 WHERE id=?');foreach(array_slice($betIds,1) as $duplicateId)$zero->execute([$duplicateId]);}
-            if($recommendation['stake']>0&&$recommendation['selection']!==null){
-                if($betIds){$bet=$pdo->prepare('UPDATE bets SET selection=?,odds=?,stake=? WHERE id=?');$bet->execute([$recommendation['selection'],$recommendation['odds'],$recommendation['stake'],$betIds[0]]);}
-                else{$bet=$pdo->prepare('INSERT INTO bets (event_id,fight_id,owner,selection,market,odds,stake) VALUES (?,?,"jev",?,"moneyline",?,?)');$bet->execute([$fight['event_id'],$fightId,$recommendation['selection'],$recommendation['odds'],$recommendation['stake']]);}
-            }elseif($betIds){$zero=$pdo->prepare('UPDATE bets SET stake=0 WHERE id=?');$zero->execute([$betIds[0]]);}
             $pdo->commit();
         } catch (Throwable $throwable) {
             $pdo->rollBack();
@@ -222,34 +216,86 @@ SQL);
             return ['selection' => null, 'odds' => null, 'edge' => $best['edge'] ?? null, 'stake' => 0.0];
         }
 
-        $bankroll = $this->bankroll('jev');
+        $bankroll = $this->bankroll('jev', 'single');
         $fraction = (float) $this->database->setting('kelly_fraction', 0.50);
-        $maxBet = $bankroll * (float) $this->database->setting('max_bet_fraction', 0.10);
+        $maxBet = $bankroll * (float) $this->database->setting('max_bet_fraction', 0.15);
         $eventLimit = $bankroll * (float) $this->database->setting('max_event_fraction', 0.35);
-        $eventExposureStmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND event_id=? AND result="open"');
+        $eventExposureStmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND event_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
         $eventExposureStmt->execute([$fight['event_id']]);
         $eventRoom = max(0.0, $eventLimit - (float) $eventExposureStmt->fetchColumn());
-        $stake = min($bankroll * $fraction * $best['kelly'], $maxBet, $eventRoom, $this->availableBankroll('jev'));
+        $stake = min($bankroll * $fraction * $best['kelly'], $maxBet, $eventRoom, $this->availableBankroll('jev', 'single'));
         $stake = floor(max(0.0, $stake) * 100) / 100;
         return ['selection' => $best['name'], 'odds' => $best['decimal'], 'edge' => $best['edge'], 'stake' => $stake];
     }
 
-    public function bankroll(string $owner): float
+    public function bankroll(string $owner, string $mode = 'single'): float
     {
         $start = (float) $this->database->setting('starting_bankroll', 500.0);
-        $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(profit),0) FROM bets WHERE owner=? AND result != "open"');
-        $stmt->execute([$owner]);
+        if ($owner === 'me') {
+            $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(profit),0) FROM bets WHERE owner=? AND result != "open"');
+            $stmt->execute([$owner]);
+            return round($start + (float) $stmt->fetchColumn(), 2);
+        }
+        $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(profit),0) FROM bets WHERE owner="jev" AND result != "open" AND ' . $this->modeMarketSql($mode));
+        $stmt->execute();
         return round($start + (float) $stmt->fetchColumn(), 2);
     }
 
-    public function availableBankroll(string $owner): float
+    public function availableBankroll(string $owner, string $mode = 'single'): float
     {
-        $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner=? AND result="open"');
-        $stmt->execute([$owner]);
-        return max(0.0, $this->bankroll($owner) - (float) $stmt->fetchColumn());
+        if ($owner === 'me') {
+            $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner=? AND result="open"');
+            $stmt->execute([$owner]);
+            return max(0.0, $this->bankroll($owner) - (float) $stmt->fetchColumn());
+        }
+        $stmt = $this->database->pdo()->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND result="open" AND ' . $this->modeMarketSql($mode));
+        $stmt->execute();
+        return max(0.0, $this->bankroll('jev', $mode) - (float) $stmt->fetchColumn());
     }
 
-    public function finalizeEventPortfolio(int $eventId): array
+    public function ownerMetrics(string $owner, string $mode = 'single'): array
+    {
+        if ($owner === 'me') {
+            $metricStmt = $this->database->pdo()->prepare("SELECT COUNT(*) total, SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) wins, SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) losses, COALESCE(SUM(CASE WHEN result!='open' THEN stake ELSE 0 END),0) settled_stake, COALESCE(SUM(profit),0) profit FROM bets WHERE owner=? AND stake>0");
+            $metricStmt->execute([$owner]);
+        } else {
+            $metricStmt = $this->database->pdo()->prepare("SELECT COUNT(*) total, SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) wins, SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) losses, COALESCE(SUM(CASE WHEN result!='open' THEN stake ELSE 0 END),0) settled_stake, COALESCE(SUM(profit),0) profit FROM bets WHERE owner='jev' AND stake>0 AND " . $this->modeMarketSql($mode));
+            $metricStmt->execute();
+        }
+        $row = $metricStmt->fetch();
+        $settledStake = (float) $row['settled_stake'];
+        $roi = 0.0;
+        if ($settledStake > 0) {
+            $roi = (float) $row['profit'] / $settledStake;
+        }
+        return [
+            'bankroll' => $this->bankroll($owner, $mode),
+            'available' => $this->availableBankroll($owner, $mode),
+            'total_bets' => (int) $row['total'],
+            'wins' => (int) $row['wins'],
+            'losses' => (int) $row['losses'],
+            'profit' => (float) $row['profit'],
+            'roi' => $roi,
+        ];
+    }
+
+    private function modeMarketSql(string $mode): string
+    {
+        if ($mode === 'ticket') {
+            return 'market IN ("kombinacija","sistem")';
+        }
+        return 'market NOT IN ("kombinacija","sistem")';
+    }
+
+    public function finalizeEventPortfolio(int $eventId, string $mode = 'ticket'): array
+    {
+        if ($mode === 'single') {
+            return $this->finalizeSinglesPortfolio($eventId);
+        }
+        return $this->finalizeTicketPortfolio($eventId);
+    }
+
+    private function collectCandidates(int $eventId): array
     {
         $pdo = $this->database->pdo();
         $stmt = $pdo->prepare(<<<'SQL'
@@ -261,65 +307,205 @@ WHERE p.id=(SELECT p2.id FROM predictions p2 WHERE p2.fight_id=f.id ORDER BY p2.
 SQL);
         $stmt->execute([$eventId]);
         $candidates = [];
-        $rows=$stmt->fetchAll();
-        $analyzedCount=count($rows);
+        $rows = $stmt->fetchAll();
         foreach ($rows as $row) {
             $options = [];
-            if ($row['odds_a'] !== null) $options[] = ['selection'=>$row['fighter_a'],'p'=>(float)$row['p_a'],'odds'=>(float)$row['odds_a']];
-            if ($row['odds_b'] !== null) $options[] = ['selection'=>$row['fighter_b'],'p'=>(float)$row['p_b'],'odds'=>(float)$row['odds_b']];
-            foreach ($options as &$option) $option['edge'] = $option['p'] - (1 / $option['odds']);
+            if ($row['odds_a'] !== null) {
+                $options[] = ['selection' => $row['fighter_a'], 'p' => (float) $row['p_a'], 'odds' => (float) $row['odds_a']];
+            }
+            if ($row['odds_b'] !== null) {
+                $options[] = ['selection' => $row['fighter_b'], 'p' => (float) $row['p_b'], 'odds' => (float) $row['odds_b']];
+            }
+            foreach ($options as &$option) {
+                $option['edge'] = $option['p'] - (1 / $option['odds']);
+            }
             unset($option);
-            usort($options, static fn(array $a,array $b): int => $b['edge'] <=> $a['edge']);
-            if (!$options) continue;
+            usort($options, static fn(array $a, array $b): int => $b['edge'] <=> $a['edge']);
+            if (!$options) {
+                continue;
+            }
             $best = $options[0];
-            $best['fight_id']=(int)$row['fight_id']; $best['prediction_id']=(int)$row['prediction_id'];
-            $best['confidence']=(float)$row['confidence'];
-            $best['kelly']=(($best['odds']*$best['p'])-1)/max(.01,$best['odds']-1);
-            if($best['edge'] >= (float)$this->database->setting('min_edge',.05) && $best['kelly']>0 && $best['confidence']>=.55) $candidates[]=$best;
+            $best['fight_id'] = (int) $row['fight_id'];
+            $best['prediction_id'] = (int) $row['prediction_id'];
+            $best['confidence'] = (float) $row['confidence'];
+            $best['fighter_a'] = (string) $row['fighter_a'];
+            $best['fighter_b'] = (string) $row['fighter_b'];
+            $best['kelly'] = (($best['odds'] * $best['p']) - 1) / max(.01, $best['odds'] - 1);
+            if ($best['edge'] >= (float) $this->database->setting('min_edge', .05) && $best['kelly'] > 0 && $best['confidence'] >= .55) {
+                $candidates[] = $best;
+            }
         }
-        usort($candidates, static fn(array $a,array $b): int => $b['edge'] <=> $a['edge']);
-        $bankroll = $this->bankroll('jev');
-        $otherStmt = $pdo->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND result="open" AND event_id!=?');
+        usort($candidates, static fn(array $a, array $b): int => $b['edge'] <=> $a['edge']);
+        return ['candidates' => $candidates, 'analyzed' => count($rows)];
+    }
+
+    private function finalizeSinglesPortfolio(int $eventId): array
+    {
+        $pdo = $this->database->pdo();
+        $collected = $this->collectCandidates($eventId);
+        $candidates = $collected['candidates'];
+        $analyzedCount = $collected['analyzed'];
+        $bankroll = $this->bankroll('jev', 'single');
+        $otherStmt = $pdo->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND result="open" AND event_id!=? AND market NOT IN ("kombinacija","sistem")');
         $otherStmt->execute([$eventId]);
-        $capacity = max(0.0, $bankroll - (float)$otherStmt->fetchColumn());
-        $eventCap = min($capacity,$bankroll*(float)$this->database->setting('max_event_fraction',.35));
-        $fraction=(float)$this->database->setting('kelly_fraction',.5);
-        $maxBet=$bankroll*(float)$this->database->setting('max_bet_fraction',.1);
-        $desired=0.0;
-        foreach($candidates as &$candidate){$candidate['raw_stake']=$bankroll*$fraction*$candidate['kelly']*$candidate['confidence'];$desired+=$candidate['raw_stake'];}
+        $capacity = max(0.0, $bankroll - (float) $otherStmt->fetchColumn());
+        $eventCap = min($capacity, $bankroll * (float) $this->database->setting('max_event_fraction', .35));
+        $fraction = (float) $this->database->setting('kelly_fraction', .5);
+        $maxBet = $bankroll * (float) $this->database->setting('max_bet_fraction', .15);
+        $desired = 0.0;
+        foreach ($candidates as &$candidate) {
+            $candidate['raw_stake'] = $bankroll * $fraction * $candidate['kelly'] * $candidate['confidence'];
+            $desired += $candidate['raw_stake'];
+        }
         unset($candidate);
-        $scale=$desired>$eventCap&&$desired>0?$eventCap/$desired:1.0;
-        foreach($candidates as &$candidate)$candidate['stake']=floor(min($candidate['raw_stake']*$scale,$maxBet)*100)/100;
+        if ($desired > $eventCap && $desired > 0) {
+            $scale = $eventCap / $desired;
+        } else {
+            $scale = 1.0;
+        }
+        foreach ($candidates as &$candidate) {
+            $candidate['stake'] = floor(min($candidate['raw_stake'] * $scale, $maxBet) * 100) / 100;
+        }
         unset($candidate);
-        $selected=array_values(array_filter($candidates,static fn(array $candidate):bool=>$candidate['stake']>0));
-        $target=round(array_sum(array_column($selected,'stake')),2);
+        $selected = [];
+        foreach ($candidates as $candidate) {
+            if ($candidate['stake'] > 0) {
+                $selected[] = $candidate;
+            }
+        }
+        $target = round(array_sum(array_column($selected, 'stake')), 2);
+        $pdo->beginTransaction();
+        try {
+            $existingStmt = $pdo->prepare('SELECT * FROM bets WHERE owner="jev" AND event_id=? AND result="open" AND market NOT IN ("kombinacija","sistem")');
+            $existingStmt->execute([$eventId]);
+            $existing = [];
+            foreach ($existingStmt->fetchAll() as $bet) {
+                $existing[(int) $bet['fight_id']] = $bet;
+            }
+            $updateBet = $pdo->prepare('UPDATE bets SET selection=?,odds=?,stake=? WHERE id=?');
+            $insertBet = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"jev",?,"moneyline",?,?)');
+            $updatePrediction = $pdo->prepare('UPDATE predictions SET recommended_bet=?,recommended_odds=?,edge=?,stake=? WHERE id=?');
+            foreach ($selected as $candidate) {
+                if (isset($existing[$candidate['fight_id']])) {
+                    $updateBet->execute([$candidate['selection'], $candidate['odds'], $candidate['stake'], $existing[$candidate['fight_id']]['id']]);
+                    unset($existing[$candidate['fight_id']]);
+                } else {
+                    $insertBet->execute([$eventId, $candidate['fight_id'], $candidate['selection'], $candidate['odds'], $candidate['stake']]);
+                }
+                $updatePrediction->execute([$candidate['selection'], $candidate['odds'], $candidate['edge'], $candidate['stake'], $candidate['prediction_id']]);
+            }
+            foreach ($existing as $bet) {
+                $updateBet->execute([$bet['selection'], $bet['odds'], 0, $bet['id']]);
+            }
+            $pdo->commit();
+        } catch (Throwable $throwable) {
+            $pdo->rollBack();
+            throw $throwable;
+        }
+        $bets = [];
+        foreach ($selected as $c) {
+            $bets[] = [
+                'fight_id' => $c['fight_id'],
+                'selection' => $c['selection'],
+                'odds' => $c['odds'],
+                'probability' => $c['p'],
+                'edge' => $c['edge'],
+                'stake' => $c['stake'],
+                'market' => 'moneyline',
+            ];
+        }
+        return [
+            'event_id' => $eventId,
+            'mode' => 'single',
+            'total_stake' => $target,
+            'minimum_required' => 0,
+            'skipped' => $analyzedCount - count($selected),
+            'ticket' => null,
+            'bets' => $bets,
+        ];
+    }
+
+    private function finalizeTicketPortfolio(int $eventId): array
+    {
+        $pdo = $this->database->pdo();
+        $collected = $this->collectCandidates($eventId);
+        $candidates = $collected['candidates'];
+        $analyzedCount = $collected['analyzed'];
+        $bankroll = $this->bankroll('jev', 'ticket');
+        $otherStmt = $pdo->prepare('SELECT COALESCE(SUM(stake),0) FROM bets WHERE owner="jev" AND result="open" AND event_id!=? AND market IN ("kombinacija","sistem")');
+        $otherStmt->execute([$eventId]);
+        $capacity = max(0.0, $bankroll - (float) $otherStmt->fetchColumn());
+        $fraction = (float) $this->database->setting('kelly_fraction', .5);
+        $engine = new EstaveTicketService();
+        $ticket = $engine->buildTicket($candidates, $bankroll, [
+            'kelly_fraction' => $fraction,
+            'max_bet_fraction' => (float) $this->database->setting('max_bet_fraction', .15),
+            'max_event_fraction' => (float) $this->database->setting('max_event_fraction', .35),
+            'available' => $capacity,
+        ]);
 
         $pdo->beginTransaction();
         try {
-            $existingStmt=$pdo->prepare('SELECT * FROM bets WHERE owner="jev" AND event_id=? AND result="open"');
-            $existingStmt->execute([$eventId]);
-            $existing=[];
-            foreach($existingStmt->fetchAll() as $bet) $existing[(int)$bet['fight_id']]=$bet;
-            $updateBet=$pdo->prepare('UPDATE bets SET selection=?,odds=?,stake=? WHERE id=?');
-            $insertBet=$pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"jev",?,"moneyline",?,?)');
-            $updatePrediction=$pdo->prepare('UPDATE predictions SET recommended_bet=?,recommended_odds=?,edge=?,stake=? WHERE id=?');
-            foreach($selected as $candidate){
-                if(isset($existing[$candidate['fight_id']])){
-                    $updateBet->execute([$candidate['selection'],$candidate['odds'],$candidate['stake'],$existing[$candidate['fight_id']]['id']]);
-                    unset($existing[$candidate['fight_id']]);
+            $existingTicketStmt = $pdo->prepare('SELECT * FROM bets WHERE owner="jev" AND event_id=? AND result="open" AND market IN ("kombinacija","sistem") ORDER BY id DESC');
+            $existingTicketStmt->execute([$eventId]);
+            $existingTickets = $existingTicketStmt->fetchAll();
+            $updateTicket = $pdo->prepare('UPDATE bets SET fight_id=?, selection=?, market=?, odds=?, stake=? WHERE id=?');
+            $insertTicket = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"jev",?,?,?,?)');
+            $updatePrediction = $pdo->prepare('UPDATE predictions SET recommended_bet=?,recommended_odds=?,edge=?,stake=? WHERE id=?');
+            $target = 0.0;
+            $bets = [];
+            if ($ticket !== null) {
+                $selectionJson = $engine->encodeSelection($ticket);
+                $firstFightId = (int) $ticket['legs'][0]['fight_id'];
+                if ($existingTickets) {
+                    $keepId = (int) $existingTickets[0]['id'];
+                    $updateTicket->execute([$firstFightId, $selectionJson, $ticket['market'], $ticket['combined_odds'], $ticket['stake'], $keepId]);
+                    foreach (array_slice($existingTickets, 1) as $duplicate) {
+                        $updateTicket->execute([(int) $duplicate['fight_id'], $duplicate['selection'], $duplicate['market'], $duplicate['odds'], 0, $duplicate['id']]);
+                    }
                 } else {
-                    $insertBet->execute([$eventId,$candidate['fight_id'],$candidate['selection'],$candidate['odds'],$candidate['stake']]);
+                    $insertTicket->execute([$eventId, $firstFightId, $selectionJson, $ticket['market'], $ticket['combined_odds'], $ticket['stake']]);
                 }
-                $updatePrediction->execute([$candidate['selection'],$candidate['odds'],$candidate['edge'],$candidate['stake'],$candidate['prediction_id']]);
-            }
-            foreach($existing as $bet){
-                $updateBet->execute([$bet['selection'],$bet['odds'],0,$bet['id']]);
-                $zeroPrediction=$pdo->prepare('UPDATE predictions SET stake=0 WHERE fight_id=? AND status="open"');
-                $zeroPrediction->execute([$bet['fight_id']]);
+                foreach ($ticket['legs'] as $leg) {
+                    $legStake = 0.0;
+                    $updatePrediction->execute([$leg['selection'], $leg['odds'], $leg['edge'], $legStake, $leg['prediction_id']]);
+                }
+                $target = $ticket['stake'];
+                $bets[] = [
+                    'fight_id' => $firstFightId,
+                    'selection' => $ticket['label'],
+                    'odds' => $ticket['combined_odds'],
+                    'probability' => $ticket['combined_p'],
+                    'edge' => $ticket['combined_edge'],
+                    'stake' => $ticket['stake'],
+                    'market' => $ticket['market'],
+                    'legs' => $ticket['legs'],
+                    'possible_payout' => $ticket['possible_payout'],
+                    'possible_profit' => $ticket['possible_profit'],
+                ];
+            } else {
+                foreach ($existingTickets as $duplicate) {
+                    $updateTicket->execute([(int) $duplicate['fight_id'], $duplicate['selection'], $duplicate['market'], $duplicate['odds'], 0, $duplicate['id']]);
+                }
             }
             $pdo->commit();
-        } catch(Throwable $throwable){$pdo->rollBack();throw $throwable;}
-        return ['event_id'=>$eventId,'total_stake'=>$target,'minimum_required'=>0,'skipped'=>$analyzedCount-count($selected),'bets'=>array_map(static fn(array $c):array=>['fight_id'=>$c['fight_id'],'selection'=>$c['selection'],'odds'=>$c['odds'],'probability'=>$c['p'],'edge'=>$c['edge'],'stake'=>$c['stake']],$selected)];
+        } catch (Throwable $throwable) {
+            $pdo->rollBack();
+            throw $throwable;
+        }
+        $skipped = $analyzedCount;
+        if ($ticket !== null) {
+            $skipped = $analyzedCount - count($ticket['legs']);
+        }
+        return [
+            'event_id' => $eventId,
+            'mode' => 'ticket',
+            'total_stake' => $target,
+            'minimum_required' => EstaveTicketService::MIN_LEGS,
+            'skipped' => $skipped,
+            'ticket' => $ticket,
+            'bets' => $bets,
+        ];
     }
 
     private function hydratePrediction(array $prediction): array
