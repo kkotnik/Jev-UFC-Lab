@@ -1,0 +1,240 @@
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/src/bootstrap.php';
+
+try {
+    $database = app_db();
+    $pdo = $database->pdo();
+    $service = new PredictionService($database);
+    $action = (string) ($_GET['action'] ?? 'dashboard');
+    $input = request_json();
+
+    if ($action === 'dashboard') {
+        $pdo->exec("UPDATE events SET status='past_unsettled' WHERE status='upcoming' AND substr(event_date,1,10) < date('now')");
+        $events = $pdo->query('SELECT * FROM events ORDER BY event_date DESC')->fetchAll();
+        if (isset($_GET['event_id'])) {
+            $eventId=(int)$_GET['event_id'];
+        } else {
+            $current=$pdo->query("SELECT id FROM events WHERE substr(event_date,1,10)>=date('now') AND status='upcoming' ORDER BY event_date ASC LIMIT 1")->fetchColumn();
+            $eventId=(int)($current?:($events[0]['id']??0));
+        }
+        $fightStmt = $pdo->prepare(<<<'SQL'
+SELECT f.*, p.id prediction_id, p.winner_pick, p.p_a, p.p_b, p.confidence, p.method_pick,
+       p.recommended_bet, p.recommended_odds, p.edge, p.stake prediction_stake,
+       p.created_at prediction_created_at, p.status prediction_status,
+       CASE WHEN p.raw_json LIKE '%pre_fight_enrichment%' THEN 1 ELSE 0 END prediction_enriched
+FROM fights f
+LEFT JOIN predictions p ON p.id = (SELECT p2.id FROM predictions p2 WHERE p2.fight_id=f.id ORDER BY p2.id DESC LIMIT 1)
+WHERE f.event_id=? ORDER BY f.card_order
+SQL);
+        $fightStmt->execute([$eventId]);
+        $fights = $fightStmt->fetchAll();
+        foreach ($fights as &$fight) {
+            foreach (['odds_a','odds_b','p_a','p_b','confidence','recommended_odds','edge','prediction_stake'] as $field) {
+                $fight[$field] = $fight[$field] === null ? null : (float) $fight[$field];
+            }
+            $fight['prefight']=(new PreFightDataService($database))->getFightData((int)$fight['id'],false);
+        }
+        unset($fight);
+        $betsStmt = $pdo->prepare('SELECT b.*, f.fighter_a, f.fighter_b FROM bets b LEFT JOIN fights f ON f.id=b.fight_id WHERE b.event_id=? ORDER BY b.id DESC');
+        $betsStmt->execute([$eventId]);
+        $bets = $betsStmt->fetchAll();
+        $metrics = [];
+        foreach (['jev', 'me'] as $owner) {
+            $metricStmt = $pdo->prepare("SELECT COUNT(*) total, SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) wins, SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) losses, COALESCE(SUM(CASE WHEN result!='open' THEN stake ELSE 0 END),0) settled_stake, COALESCE(SUM(profit),0) profit FROM bets WHERE owner=?");
+            $metricStmt->execute([$owner]);
+            $row = $metricStmt->fetch();
+            $settledStake = (float) $row['settled_stake'];
+            $metrics[$owner] = [
+                'bankroll' => $service->bankroll($owner), 'available' => $service->availableBankroll($owner),
+                'total_bets' => (int) $row['total'], 'wins' => (int) $row['wins'], 'losses' => (int) $row['losses'],
+                'profit' => (float) $row['profit'], 'roi' => $settledStake > 0 ? (float) $row['profit'] / $settledStake : 0,
+            ];
+        }
+        $settled = $pdo->query('SELECT p.p_a,f.fighter_a,f.winner FROM predictions p JOIN fights f ON f.id=p.fight_id WHERE f.completed=1 AND f.winner IS NOT NULL')->fetchAll();
+        $brier = null;
+        if ($settled) {
+            $sum = 0.0;
+            foreach ($settled as $prediction) {
+                $actual = $prediction['winner'] === $prediction['fighter_a'] ? 1.0 : 0.0;
+                $sum += (((float) $prediction['p_a'] - $actual) ** 2);
+            }
+            $brier = $sum / count($settled);
+        }
+        $reportStmt = $pdo->prepare('SELECT report_json FROM event_reports WHERE event_id=? ORDER BY id DESC LIMIT 1');
+        $reportStmt->execute([$eventId]);
+        $reportJson = $reportStmt->fetchColumn();
+        $backtest = $pdo->query('SELECT * FROM backtest_runs ORDER BY id DESC LIMIT 1')->fetch();
+        if ($backtest) {
+            $backtest = (new BacktestService($database))->hydrate($backtest);
+        }
+        $history=[];
+        $historyStmt=$pdo->query("SELECT * FROM events WHERE substr(event_date,1,10)<date('now') OR status!='upcoming' ORDER BY event_date DESC");
+        $historyBetStmt=$pdo->prepare('SELECT b.*,f.fighter_a,f.fighter_b FROM bets b LEFT JOIN fights f ON f.id=b.fight_id WHERE b.event_id=? ORDER BY b.id');
+        $historyFightStmt=$pdo->prepare('SELECT f.*,p.winner_pick,p.p_a,p.p_b,p.method_pick FROM fights f LEFT JOIN predictions p ON p.id=(SELECT id FROM predictions WHERE fight_id=f.id ORDER BY id DESC LIMIT 1) WHERE f.event_id=? ORDER BY f.card_order');
+        foreach($historyStmt->fetchAll() as $pastEvent){$historyBetStmt->execute([$pastEvent['id']]);$historyFightStmt->execute([$pastEvent['id']]);$pastEvent['bets']=$historyBetStmt->fetchAll();$pastEvent['fights']=$historyFightStmt->fetchAll();$history[]=$pastEvent;}
+        json_response([
+            'ok' => true, 'events' => $events, 'event_id' => $eventId, 'fights' => $fights, 'bets' => $bets,
+            'metrics' => $metrics, 'history_count' => (int) $pdo->query('SELECT COUNT(*) FROM historical_fights')->fetchColumn(),
+            'brier' => $brier, 'api_configured' => (string) getenv('TYPESAFE_API_KEY') !== '',
+            'event_report' => $reportJson ? json_decode((string)$reportJson, true) : null,
+            'backtest' => $backtest ?: null,
+            'history' => $history,
+            'settings' => [
+                'kelly_fraction' => $database->setting('kelly_fraction', .5),
+                'max_bet_fraction' => $database->setting('max_bet_fraction', .1),
+                'max_event_fraction' => $database->setting('max_event_fraction', .35),
+                'min_edge' => $database->setting('min_edge', .05),
+            ],
+        ]);
+    }
+
+    if ($action === 'save_odds') {
+        $oddsA = nullable_decimal($input['odds_a'] ?? null);
+        $oddsB = nullable_decimal($input['odds_b'] ?? null);
+        foreach ([$oddsA, $oddsB] as $odds) {
+            if ($odds !== null && $odds <= 1.0) {
+                throw new InvalidArgumentException('Decimalna kvota mora biti večja od 1.00.');
+            }
+        }
+        $stmt = $pdo->prepare('UPDATE fights SET odds_a=?, odds_b=? WHERE id=? AND completed=0');
+        $stmt->execute([$oddsA, $oddsB, (int) ($input['fight_id'] ?? 0)]);
+        json_response(['ok' => true]);
+    }
+
+    if ($action === 'predict') {
+        $apiKey = trim((string) ($_SERVER['HTTP_X_TYPESAFE_KEY'] ?? getenv('TYPESAFE_API_KEY') ?: ''));
+        json_response(['ok' => true, 'prediction' => $service->predict((int) ($input['fight_id'] ?? 0), $apiKey)]);
+    }
+
+    if ($action === 'finalize_portfolio') {
+        json_response(['ok'=>true,'portfolio'=>$service->finalizeEventPortfolio((int)($input['event_id'] ?? 0))]);
+    }
+
+    if ($action === 'complete_event') {
+        set_time_limit(600);
+        json_response(['ok'=>true,'report'=>(new EventReviewService($database))->completeFromResults((int)($input['event_id'] ?? 0))]);
+    }
+
+    if ($action === 'run_backtest') {
+        set_time_limit(600);
+        $apiKey = trim((string) ($_SERVER['HTTP_X_TYPESAFE_KEY'] ?? getenv('TYPESAFE_API_KEY') ?: ''));
+        json_response(['ok'=>true]+(new BacktestService($database))->step($apiKey));
+    }
+
+    if ($action === 'my_bet') {
+        $fightId = (int) ($input['fight_id'] ?? 0);
+        $selection = trim((string) ($input['selection'] ?? ''));
+        $odds = (float) ($input['odds'] ?? 0);
+        $stake = round((float) ($input['stake'] ?? 0), 2);
+        $fightStmt = $pdo->prepare('SELECT * FROM fights WHERE id=? AND completed=0');
+        $fightStmt->execute([$fightId]);
+        $fight = $fightStmt->fetch();
+        if (!$fight || !in_array($selection, [$fight['fighter_a'], $fight['fighter_b']], true)) {
+            throw new InvalidArgumentException('Izberi veljavnega borca.');
+        }
+        if ($odds <= 1 || $stake <= 0 || $stake > $service->availableBankroll('me')) {
+            throw new InvalidArgumentException('Preveri kvoto, vložek in razpoložljiv bankroll.');
+        }
+        $stmt = $pdo->prepare('INSERT INTO bets(event_id,fight_id,owner,selection,market,odds,stake) VALUES(?,?,"me",?,"moneyline",?,?)');
+        $stmt->execute([$fight['event_id'], $fightId, $selection, $odds, $stake]);
+        json_response(['ok' => true]);
+    }
+
+    if ($action === 'settle_fight') {
+        $fightId = (int) ($input['fight_id'] ?? 0);
+        $winner = trim((string) ($input['winner'] ?? ''));
+        $fightStmt = $pdo->prepare('SELECT * FROM fights WHERE id=?');
+        $fightStmt->execute([$fightId]);
+        $fight = $fightStmt->fetch();
+        if (!$fight || !in_array($winner, [$fight['fighter_a'], $fight['fighter_b']], true)) {
+            throw new InvalidArgumentException('Zmagovalec ni veljaven.');
+        }
+        $pdo->beginTransaction();
+        try {
+            $update = $pdo->prepare('UPDATE fights SET winner=?,method=?,result_round=?,completed=1 WHERE id=?');
+            $round = (int) ($input['round'] ?? 0);
+            $update->execute([$winner, trim((string) ($input['method'] ?? '')), $round > 0 ? $round : null, $fightId]);
+            $bets = $pdo->prepare('SELECT * FROM bets WHERE fight_id=? AND result="open"');
+            $bets->execute([$fightId]);
+            $settle = $pdo->prepare('UPDATE bets SET result=?,profit=? WHERE id=?');
+            foreach ($bets->fetchAll() as $bet) {
+                $won = $bet['selection'] === $winner;
+                $profit = $won ? (float) $bet['stake'] * ((float) $bet['odds'] - 1) : -(float) $bet['stake'];
+                $settle->execute([$won ? 'win' : 'loss', round($profit, 2), $bet['id']]);
+            }
+            $pred = $pdo->prepare('UPDATE predictions SET status="settled", profit=COALESCE((SELECT profit FROM bets WHERE owner="jev" AND fight_id=? ORDER BY id DESC LIMIT 1),0) WHERE fight_id=? AND status="open"');
+            $pred->execute([$fightId, $fightId]);
+            $pdo->commit();
+        } catch (Throwable $throwable) {
+            $pdo->rollBack();
+            throw $throwable;
+        }
+        json_response(['ok' => true]);
+    }
+
+    if ($action === 'sync_history') {
+        $limit = max(1, min(300, (int) ($input['event_limit'] ?? 80)));
+        json_response(['ok' => true, 'sync' => (new UfcStatsSync($pdo))->sync($limit)]);
+    }
+
+    if ($action === 'sync_odds') {
+        $oddsKey = trim((string) ($_SERVER['HTTP_X_ODDS_KEY'] ?? getenv('THE_ODDS_API_KEY') ?: ''));
+        json_response(['ok' => true, 'sync' => (new OddsClient($pdo, $oddsKey))->sync()]);
+    }
+
+    if ($action === 'sync_event_card') {
+        json_response(['ok'=>true,'sync'=>(new UfcEventSync($pdo))->syncCard((int)($input['event_id']??0))]);
+    }
+
+    if ($action === 'refresh_prefight') {
+        json_response(['ok'=>true,'sync'=>(new PreFightDataService($database))->refreshEvent((int)($input['event_id']??0))]);
+    }
+
+    if ($action === 'settings') {
+        $rules = ['kelly_fraction' => [.05, 1], 'max_bet_fraction' => [.01, .30], 'max_event_fraction' => [.05, .80], 'min_edge' => [0, .25]];
+        foreach ($rules as $key => [$min, $max]) {
+            if (array_key_exists($key, $input)) {
+                $database->setSetting($key, max($min, min($max, (float) $input[$key])));
+            }
+        }
+        json_response(['ok' => true]);
+    }
+
+    if ($action === 'create_event') {
+        $name = trim((string) ($input['name'] ?? ''));
+        $date = trim((string) ($input['event_date'] ?? ''));
+        if ($name === '' || strtotime($date) === false) {
+            throw new InvalidArgumentException('Vnesi ime in veljaven datum dogodka.');
+        }
+        $stmt = $pdo->prepare('INSERT INTO events(name,event_date,venue,source_url) VALUES(?,?,?,?)');
+        $stmt->execute([$name, date(DATE_ATOM, strtotime($date)), trim((string) ($input['venue'] ?? '')), trim((string) ($input['source_url'] ?? ''))]);
+        json_response(['ok' => true, 'event_id' => (int) $pdo->lastInsertId()]);
+    }
+
+    if ($action === 'add_fight') {
+        $eventId = (int) ($input['event_id'] ?? 0);
+        $fighterA = trim((string) ($input['fighter_a'] ?? ''));
+        $fighterB = trim((string) ($input['fighter_b'] ?? ''));
+        if ($fighterA === '' || $fighterB === '' || $fighterA === $fighterB) {
+            throw new InvalidArgumentException('Vnesi dva različna borca.');
+        }
+        $orderStmt = $pdo->prepare('SELECT COALESCE(MAX(card_order),0)+1 FROM fights WHERE event_id=?');
+        $orderStmt->execute([$eventId]);
+        $stmt = $pdo->prepare('INSERT INTO fights(event_id,card_order,card_section,weight_class,fighter_a,fighter_b,odds_a,odds_b) VALUES(?,?,?,?,?,?,?,?)');
+        $stmt->execute([$eventId, (int) $orderStmt->fetchColumn(), trim((string) ($input['card_section'] ?? 'Prelims')), trim((string) ($input['weight_class'] ?? '')), $fighterA, $fighterB, nullable_decimal($input['odds_a'] ?? null), nullable_decimal($input['odds_b'] ?? null)]);
+        json_response(['ok' => true]);
+    }
+
+    throw new InvalidArgumentException('Neznana akcija.');
+} catch (InvalidArgumentException $exception) {
+    json_response(['ok' => false, 'error' => $exception->getMessage()], 422);
+} catch (Throwable $exception) {
+    json_response(['ok' => false, 'error' => $exception->getMessage()], 500);
+}
+
+function nullable_decimal(mixed $value): ?float
+{
+    return $value === null || $value === '' ? null : (float) $value;
+}
